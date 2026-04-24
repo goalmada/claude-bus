@@ -36,7 +36,7 @@ advance their own cursor. That's the whole protocol.
 ## Install
 
 ```bash
-git clone https://github.com/YOURNAME/claude-bus.git ~/Desktop/claude-bus
+git clone https://github.com/goalmada/claude-bus.git ~/Desktop/claude-bus
 cd ~/Desktop/claude-bus
 npm install
 ```

@@ -27,5 +27,13 @@
   },
   "license": "MIT",
   "author": "Diego Almada",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/goalmada/claude-bus.git"
+  },
+  "homepage": "https://github.com/goalmada/claude-bus#readme",
+  "bugs": {
+    "url": "https://github.com/goalmada/claude-bus/issues"
+  },
   "keywords": ["mcp", "claude-code", "agents", "orchestration"]
 }
