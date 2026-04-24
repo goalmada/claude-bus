@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# claude-bus CLI — peek at inboxes from a terminal.
+#
+# Usage:
+#   claude-bus peers                 list all sessions with an inbox
+#   claude-bus tail <name>           follow <name>'s inbox (like tail -f)
+#   claude-bus peek <name> [N]       print last N messages (default 10)
+#   claude-bus unread <name>         print unread count for <name>
+#   claude-bus send <from> <to> <kind> <body>
+#                                    inject a message (for testing)
+
+set -euo pipefail
+
+ROOT="${HOME}/.claude-bus"
+INBOX="${ROOT}/inbox"
+CURSOR="${ROOT}/cursor"
+mkdir -p "$INBOX" "$CURSOR"
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  peers)
+    ls -1 "$INBOX" 2>/dev/null | sed 's/\.jsonl$//' | sort
+    ;;
+  tail)
+    name="${1:?name required}"
+    file="$INBOX/$name.jsonl"
+    [ -f "$file" ] || { echo "no inbox for '$name' yet"; exit 0; }
+    if command -v jq >/dev/null 2>&1; then
+      tail -n 0 -F "$file" | jq -c '{id, from, kind, reply_to, body: (.body|tostring|.[0:200])}'
+    else
+      tail -n 0 -F "$file"
+    fi
+    ;;
+  peek)
+    name="${1:?name required}"
+    n="${2:-10}"
+    file="$INBOX/$name.jsonl"
+    [ -f "$file" ] || { echo "no inbox for '$name' yet"; exit 0; }
+    if command -v jq >/dev/null 2>&1; then
+      tail -n "$n" "$file" | jq -c '{id, from, kind, reply_to, body: (.body|tostring|.[0:200])}'
+    else
+      tail -n "$n" "$file"
+    fi
+    ;;
+  unread)
+    name="${1:?name required}"
+    file="$INBOX/$name.jsonl"
+    cfile="$CURSOR/$name.txt"
+    [ -f "$file" ] || { echo 0; exit 0; }
+    size=$(wc -c < "$file" | tr -d ' ')
+    pos=$([ -f "$cfile" ] && cat "$cfile" || echo 0)
+    if [ "$pos" -ge "$size" ]; then echo 0; exit 0; fi
+    tail -c +$((pos + 1)) "$file" | grep -c '' || true
+    ;;
+  send)
+    from="${1:?from required}"; to="${2:?to required}"
+    kind="${3:?kind required}"; body="${4:?body required}"
+    CLAUDE_BUS_NAME="$from" node -e "
+      import('$(cd "$(dirname "$0")/.." && pwd)/src/storage.js').then(async ({appendMessage}) => {
+        const m = await appendMessage({from: '$from', to: '$to', kind: '$kind', body: process.argv[1]});
+        console.log(JSON.stringify(m));
+      }).catch(e => { console.error(e.message); process.exit(1); });
+    " "$body"
+    ;;
+  ""|help|-h|--help)
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "unknown command: $cmd (try: peers, tail, peek, unread, send)" >&2
+    exit 2
+    ;;
+esac

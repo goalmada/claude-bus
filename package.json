@@ -1,0 +1,31 @@
+{
+  "name": "claude-bus",
+  "version": "0.1.0",
+  "description": "A tiny MCP server that lets Claude Code sessions send each other messages through shared inboxes.",
+  "type": "module",
+  "bin": {
+    "claude-bus-server": "src/server.js",
+    "claude-bus": "bin/claude-bus"
+  },
+  "files": [
+    "src",
+    "bin",
+    "hooks",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/smoke.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "author": "Diego Almada",
+  "keywords": ["mcp", "claude-code", "agents", "orchestration"]
+}
