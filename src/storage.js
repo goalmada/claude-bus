@@ -4,12 +4,22 @@
 //   inbox/<name>.jsonl   — append-only log of messages delivered to <name>
 //   cursor/<name>.txt    — byte offset into inbox/<name>.jsonl of the last
 //                          message this session has read
+//   active/<ppid>.txt    — identity claimed by the Claude Code session whose
+//                          PID is <ppid>. Used by the GUI app where the
+//                          CLAUDE_BUS_NAME env var can't be set per session.
 //
 // Writers only ever append to inbox files. Readers only ever advance their
 // own cursor. No locks, no rewrites, no races.
 
 import { promises as fs } from "node:fs";
-import { existsSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  unlinkSync,
+} from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -17,8 +27,9 @@ import crypto from "node:crypto";
 const ROOT = path.join(os.homedir(), ".claude-bus");
 const INBOX_DIR = path.join(ROOT, "inbox");
 const CURSOR_DIR = path.join(ROOT, "cursor");
+const ACTIVE_DIR = path.join(ROOT, "active");
 
-for (const dir of [ROOT, INBOX_DIR, CURSOR_DIR]) {
+for (const dir of [ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR]) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
@@ -172,4 +183,59 @@ export async function unreadCount(name) {
   }
 }
 
-export const _paths = { ROOT, INBOX_DIR, CURSOR_DIR, inboxPath, cursorPath };
+// ---------------------------------------------------------------------------
+// Active-identity registry, keyed by Claude Code session PID.
+// ---------------------------------------------------------------------------
+// In a terminal you set CLAUDE_BUS_NAME before launching `claude`. In the
+// Mac app there is no per-window shell, so the session calls bus_claim()
+// once at startup and we persist its name in active/<ppid>.txt. The hook
+// reads the same file so it can render the unread-mail reminder.
+
+function activePath(ppid) {
+  return path.join(ACTIVE_DIR, `${ppid}.txt`);
+}
+
+export function setActiveIdentity(ppid, name) {
+  assertName(name, "name");
+  if (!Number.isInteger(ppid) || ppid <= 0) {
+    throw new Error(`invalid ppid: ${ppid}`);
+  }
+  writeFileSync(activePath(ppid), name, "utf8");
+}
+
+export function getActiveIdentity(ppid) {
+  try {
+    return readFileSync(activePath(ppid), "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export function pruneStaleActive() {
+  let entries;
+  try {
+    entries = readdirSync(ACTIVE_DIR);
+  } catch {
+    return;
+  }
+  for (const f of entries) {
+    if (!f.endsWith(".txt")) continue;
+    const pid = parseInt(f.slice(0, -4), 10);
+    if (!Number.isFinite(pid)) continue;
+    let alive = true;
+    try {
+      process.kill(pid, 0); // signal 0 = liveness probe
+    } catch (err) {
+      // ESRCH = no such process; EPERM = exists but not ours, treat as alive
+      alive = err.code !== "ESRCH";
+    }
+    if (!alive) {
+      try { unlinkSync(path.join(ACTIVE_DIR, f)); } catch {}
+    }
+  }
+}
+
+export const _paths = {
+  ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR,
+  inboxPath, cursorPath, activePath,
+};

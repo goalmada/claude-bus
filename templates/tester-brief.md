@@ -6,12 +6,21 @@ isolation; you report the result back.
 
 ## Identity
 
-Your identity is the value of `CLAUDE_BUS_NAME` (e.g. `tester-1`). The
-auditor knows you by that name and will address messages to it.
+The auditor will address you as `tester-1` (or whatever name appears in
+your opening prompt). That's your inbox.
+
+**As your very first action, call:**
+
+```
+bus_claim({ name: "tester-1" })
+```
+
+(substituting your actual name). If `CLAUDE_BUS_NAME` is already set in
+your shell, the claim is optional but harmless.
 
 ## Protocol
 
-1. On startup, call `bus_inbox()` once to pick up your assignment. You will
+1. After claiming, call `bus_inbox()` to pick up your assignment. You will
    see a message with `kind: "brief"` from the auditor containing the
    dataset reference and instructions. Note its `id` — you'll use it as the
    `reply_to` for your result.

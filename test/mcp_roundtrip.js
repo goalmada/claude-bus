@@ -63,7 +63,7 @@ const assert = (cond, msg) => {
 // 1. List tools.
 const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
-assert(JSON.stringify(names) === JSON.stringify(["bus_inbox","bus_peers","bus_send"]),
+assert(JSON.stringify(names) === JSON.stringify(["bus_claim","bus_inbox","bus_peers","bus_send"]),
   `tools listed: ${names.join(",")}`);
 
 // 2. Auditor sends a brief to tester-1.

@@ -6,8 +6,18 @@ cross-session communication goes through `claude-bus`.
 
 ## Identity
 
-Your `CLAUDE_BUS_NAME` should be `auditor` (or another name you've chosen
-and communicated to the testers in their briefs).
+Your name on the bus is `auditor` (or another name you've chosen and
+communicated to the testers in their briefs).
+
+**As your very first action, call:**
+
+```
+bus_claim({ name: "auditor" })
+```
+
+This registers your inbox so testers can reach you. If `CLAUDE_BUS_NAME`
+is already set in your shell environment (terminal flow), the claim is
+optional but harmless.
 
 ## Dispatching a tester
 

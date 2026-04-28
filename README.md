@@ -69,8 +69,11 @@ clobber them:
 }
 ```
 
-Then set `CLAUDE_BUS_NAME` before launching Claude Code in each terminal
-that should participate:
+### Setting a session's identity
+
+There are two ways to tell a session who it is:
+
+**Terminal flow.** Export `CLAUDE_BUS_NAME` before launching Claude Code:
 
 ```bash
 CLAUDE_BUS_NAME=auditor claude
@@ -78,9 +81,19 @@ CLAUDE_BUS_NAME=auditor claude
 CLAUDE_BUS_NAME=tester-1 claude
 ```
 
-The server is lenient about the env var being unset: sessions without
-`CLAUDE_BUS_NAME` will see the tools but get a helpful error if they try
-to call them. Safe to install globally.
+**Mac app / GUI flow.** GUI Claude Code can't inherit shell env vars, so
+the session claims its identity at runtime by calling the `bus_claim`
+tool. Paste this as the first line of the session's opening prompt:
+
+```
+First, call bus_claim({ name: "auditor" }) to register me on the bus.
+```
+
+(swap in `tester-1`, `tester-2`, etc. for worker sessions). The
+templates under `templates/` already include this step.
+
+Safe to install globally either way: sessions that never claim an
+identity see the tools but get a helpful error if they call them.
 
 ## Tools
 

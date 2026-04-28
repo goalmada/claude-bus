@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/smoke.js"
+    "test": "node test/smoke.js && node test/mcp_roundtrip.js && node test/mcp_claim_flow.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

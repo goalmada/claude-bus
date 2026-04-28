@@ -17,19 +17,65 @@ import {
   readInbox,
   listPeers,
   unreadCount,
+  setActiveIdentity,
+  getActiveIdentity,
+  pruneStaleActive,
   MAX_BODY_BYTES,
 } from "./storage.js";
 
-// If CLAUDE_BUS_NAME is unset, the server still starts but every tool call
-// returns a helpful error. This keeps the server well-behaved when it's
-// configured globally but the current terminal didn't opt in to the bus.
-const SELF = process.env.CLAUDE_BUS_NAME || null;
+// Identity resolution, in order:
+//   1. CLAUDE_BUS_NAME env var          — terminal flow
+//   2. bus_claim() called this session  — Mac app / GUI flow
+//   3. active/<ppid>.txt on disk        — persists across MCP server restarts
+//                                          within one Claude Code session
+//   4. nothing                           — tool calls return a helpful error
+//
+// The PID we key on is process.ppid: the Claude Code session that spawned
+// this MCP server over stdio. Each Claude Code session has its own MCP
+// subprocess, so ppid is unique per session.
+
+let _selfClaimed = null;
+
+function resolveSelf() {
+  if (process.env.CLAUDE_BUS_NAME) return process.env.CLAUDE_BUS_NAME;
+  if (_selfClaimed) return _selfClaimed;
+  const fromFile = getActiveIdentity(process.ppid);
+  if (fromFile) {
+    _selfClaimed = fromFile;
+    return fromFile;
+  }
+  return null;
+}
+
 const NO_NAME_HINT =
-  "claude-bus is not active in this session. Set CLAUDE_BUS_NAME " +
-  "(e.g. export CLAUDE_BUS_NAME=auditor) before launching claude, " +
-  "then restart the session.";
+  "claude-bus is not active in this session. Call bus_claim with a " +
+  "name (e.g. bus_claim({name: 'auditor'})) to register this session. " +
+  "Or, in a terminal, restart Claude Code with CLAUDE_BUS_NAME=<name> " +
+  "set in your shell.";
+
+// Best-effort cleanup of stale entries from ended sessions.
+try { pruneStaleActive(); } catch {}
 
 const TOOLS = [
+  {
+    name: "bus_claim",
+    description:
+      "Register this session's identity on the bus. Call once at session " +
+      "start before bus_send/bus_inbox. The name is what other sessions " +
+      "address their messages to. In a terminal you can skip this if " +
+      "CLAUDE_BUS_NAME is already set in the environment.",
+    inputSchema: {
+      type: "object",
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          description: "1-64 chars, [a-zA-Z0-9_-] only (e.g. 'auditor', 'tester-1')",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
   {
     name: "bus_send",
     description:
@@ -82,6 +128,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
+
+  // bus_claim is the one tool that's allowed before identity is set.
+  if (name === "bus_claim") {
+    try {
+      setActiveIdentity(process.ppid, args.name);
+      _selfClaimed = args.name;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { ok: true, identity: args.name, ppid: process.ppid },
+              null, 2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `claude-bus error: ${err.message}` }],
+      };
+    }
+  }
+
+  const SELF = resolveSelf();
   if (!SELF) {
     return {
       isError: true,
