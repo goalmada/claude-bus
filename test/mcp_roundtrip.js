@@ -100,13 +100,19 @@ assert(replyPayload.messages.length === 1, "auditor sees 1 reply");
 assert(replyPayload.messages[0].reply_to === briefId, "reply_to threads correctly");
 assert(replyPayload.messages[0].body === "PASS 42/42", "result body matches");
 
-// 6. Peers.
+// 6. Peers — new rich shape: array of {name, alive, has_inbox, unread}.
 const peersRes = await auditor.call("tools/call", {
   name: "bus_peers", arguments: {},
 });
 const peersPayload = JSON.parse(peersRes.result.content[0].text);
-assert(peersPayload.peers.includes("tester-1") && peersPayload.peers.includes("auditor"),
-  `peers: ${peersPayload.peers.join(",")}`);
+const peerNames = peersPayload.peers.map((p) => p.name);
+assert(peerNames.includes("tester-1") && peerNames.includes("auditor"),
+  `peers: ${peerNames.join(",")}`);
+const testerPeer = peersPayload.peers.find((p) => p.name === "tester-1");
+assert(testerPeer && testerPeer.alive === true,
+  `tester-1 alive=${testerPeer?.alive}`);
+assert(typeof testerPeer.unread === "number",
+  "tester-1 has unread count");
 
 auditor.proc.kill();
 tester.proc.kill();

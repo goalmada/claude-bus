@@ -126,8 +126,27 @@ Returns unread messages for *this* session and advances the cursor.
 `peek: true` reads without advancing.
 
 ### `bus_peers()`
-Lists every session with an inbox on this machine, plus this session's
-unread count.
+Returns every name known to the bus with rich status:
+
+```json
+{
+  "self": "auditor",
+  "unread": 3,
+  "peers": [
+    {"name": "auditor",   "alive": true,  "has_inbox": true,  "unread": 3},
+    {"name": "tester-1",  "alive": true,  "has_inbox": false, "unread": 0},
+    {"name": "tester-2",  "alive": false, "has_inbox": true,  "unread": 1}
+  ]
+}
+```
+
+`alive: true` means at least one Claude Code process is currently
+holding that name — i.e., you can `bus_send` to it and the message
+will reach a live session. `alive: false` means the session ended
+(window closed, process gone). `has_inbox: true` means the peer has
+received messages at some point. `unread` is the queue depth in that
+peer's inbox right now — useful for spotting workers that have stopped
+keeping up.
 
 ## CLI
 

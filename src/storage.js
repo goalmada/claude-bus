@@ -158,6 +158,66 @@ export async function listPeers() {
     .sort();
 }
 
+// Rich peer listing: every name that has either claimed an identity or
+// received mail. For each, indicates whether at least one Claude Code
+// process holding that name is still alive, and how many messages are
+// currently queued in its inbox.
+export async function listPeerInfo() {
+  pruneStaleActive();
+
+  const peers = new Map(); // name -> { alive, has_inbox }
+
+  // Names with inboxes (received mail at some point).
+  try {
+    const entries = await fs.readdir(INBOX_DIR);
+    for (const f of entries) {
+      if (!f.endsWith(".jsonl")) continue;
+      const name = f.slice(0, -".jsonl".length);
+      peers.set(name, { alive: false, has_inbox: true });
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  // Names with active claims (somebody is currently a session by this name).
+  let activeFiles = [];
+  try {
+    activeFiles = await fs.readdir(ACTIVE_DIR);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  for (const f of activeFiles) {
+    if (!f.endsWith(".txt")) continue;
+    const pid = parseInt(f.slice(0, -4), 10);
+    if (!Number.isFinite(pid)) continue;
+
+    let name;
+    try {
+      name = (await fs.readFile(path.join(ACTIVE_DIR, f), "utf8")).trim();
+    } catch {
+      continue;
+    }
+    if (!name) continue;
+
+    let alive = true;
+    try { process.kill(pid, 0); }
+    catch (err) { alive = err.code !== "ESRCH"; }
+
+    const prev = peers.get(name) || { alive: false, has_inbox: false };
+    peers.set(name, { ...prev, alive: prev.alive || alive });
+  }
+
+  // Attach unread counts.
+  const result = [];
+  for (const [name, info] of peers.entries()) {
+    let unread = 0;
+    try { unread = await unreadCount(name); } catch {}
+    result.push({ name, alive: info.alive, has_inbox: info.has_inbox, unread });
+  }
+  result.sort((a, b) => a.name.localeCompare(b.name));
+  return result;
+}
+
 export async function unreadCount(name) {
   const file = inboxPath(name);
   try {

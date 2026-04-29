@@ -16,6 +16,7 @@ import {
   appendMessage,
   readInbox,
   listPeers,
+  listPeerInfo,
   unreadCount,
   setActiveIdentity,
   getActiveIdentity,
@@ -55,6 +56,13 @@ const NO_NAME_HINT =
 
 // Best-effort cleanup of stale entries from ended sessions.
 try { pruneStaleActive(); } catch {}
+
+// If identity came from the env (terminal flow), record it in the active
+// registry too. This unifies the two flows so bus_peers can report
+// liveness uniformly regardless of how the session was named.
+if (process.env.CLAUDE_BUS_NAME) {
+  try { setActiveIdentity(process.ppid, process.env.CLAUDE_BUS_NAME); } catch {}
+}
 
 const TOOLS = [
   {
@@ -113,14 +121,18 @@ const TOOLS = [
   {
     name: "bus_peers",
     description:
-      "List all sessions that have an inbox on this machine. Useful for " +
-      "discovering which testers/workers are online.",
+      "List every session known to the bus, with liveness and unread " +
+      "count. A peer is 'alive' if at least one Claude Code process " +
+      "currently holds its name (i.e. you can still message it). " +
+      "'has_inbox' means the peer has received messages at some point. " +
+      "'unread' is how many messages are queued in that peer's inbox " +
+      "right now (useful for spotting stuck workers).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.1.0" },
+  { name: "claude-bus", version: "0.2.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -194,7 +206,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
     if (name === "bus_peers") {
-      const peers = await listPeers();
+      const peers = await listPeerInfo();
       const mine = await unreadCount(SELF);
       return {
         content: [
