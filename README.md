@@ -151,8 +151,10 @@ Returns unread messages for *this* session and advances the cursor.
 
 In normal use you rarely need to call this — the `UserPromptSubmit` and
 `Stop` hooks already deliver new mail inline as system-reminders, with
-bodies included (truncated to 800 chars per message). Use `bus_inbox`
-mainly for re-reading or fetching messages that arrived mid-turn.
+bodies included in full (the per-message cap matches the `bus_send`
+body limit of 8 KB, so any message that sent successfully is delivered
+intact). Use `bus_inbox(peek: true)` to re-read history or to fetch
+the rare oversized message that hit the defensive truncation.
 
 ### `bus_peers()`
 Returns every name known to the bus with rich status:

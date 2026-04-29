@@ -29,9 +29,18 @@ unread_text=$(tail -c +$((pos + 1)) "$file")
 unread_count=$(echo "$unread_text" | grep -c '' || true)
 [ "$unread_count" -gt 0 ] || exit 0
 
-# Per-message body cap (chars). Big bodies are noted and the model can
-# call bus_inbox(peek: true) to re-read in full if needed.
-BODY_CAP=800
+# Per-message body cap (chars). Matches the bus_send body limit
+# (MAX_BODY_BYTES in storage.js = 8192 bytes), so any message that
+# successfully went through bus_send is delivered in full inline.
+# Truncation is now a defensive safety net for messages injected past
+# send validation (e.g. via a future direct-write tool), not a routine
+# context-saving measure. If a worker is producing huge bodies, the
+# right move is still to write to a file and send a path summary —
+# but normal-sized briefs and result summaries never get clipped.
+#
+# Override at install time via CLAUDE_BUS_BODY_CAP if you want a
+# tighter context budget per message.
+BODY_CAP="${CLAUDE_BUS_BODY_CAP:-8192}"
 
 # Render. node is available in any Claude Code host; use it for safe
 # JSON parsing. Falls back to a plain dump if node is somehow missing.
