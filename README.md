@@ -116,6 +116,30 @@ identity see the tools but get a helpful error if they call them.
 
 ## Tools
 
+### `bus_claim(name)`
+Registers this session's identity. The response includes a short protocol
+primer so a freshly-started orchestrator/worker can use the bus correctly
+without coaching.
+
+### `bus_spawn_worker(name, brief, long_running?)`
+Generates a self-contained brief for a new worker and returns
+`spawn_task` arguments ready to invoke. The orchestrator passes plain
+English; the tool handles the bus-protocol boilerplate (claim, listen,
+reply with `reply_to` set, file output for big results). Pass
+`long_running: true` for workers that should stay open after their
+first reply to handle follow-ups.
+
+Typical use:
+```
+bus_spawn_worker({
+  name: "impact-analyzer",
+  brief: "Run a Spearman correlation between cb_post_views.impact_score
+          and view counts. Report findings in the body."
+})
+// → returns { spawn_task_args: { title, tldr, prompt } }
+// Then call spawn_task with those args. User clicks chip, worker runs.
+```
+
 ### `bus_send(to, kind, body, reply_to?)`
 Appends a message to the recipient's inbox. Returns `{ok, id,
 delivered_at}`. Body capped at 8 KB — for larger payloads, write to a
@@ -124,6 +148,11 @@ file and send the path plus a summary.
 ### `bus_inbox(peek?)`
 Returns unread messages for *this* session and advances the cursor.
 `peek: true` reads without advancing.
+
+In normal use you rarely need to call this — the `UserPromptSubmit` and
+`Stop` hooks already deliver new mail inline as system-reminders, with
+bodies included (truncated to 800 chars per message). Use `bus_inbox`
+mainly for re-reading or fetching messages that arrived mid-turn.
 
 ### `bus_peers()`
 Returns every name known to the bus with rich status:

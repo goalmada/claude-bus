@@ -54,6 +54,64 @@ const NO_NAME_HINT =
   "Or, in a terminal, restart Claude Code with CLAUDE_BUS_NAME=<name> " +
   "set in your shell.";
 
+// Protocol primer attached to every successful bus_claim response so a
+// freshly-started orchestrator/worker knows the workflow without extra
+// coaching from the user.
+const PROTOCOL_PRIMER = `You are now identified on claude-bus. Quick protocol:
+
+• To delegate work to a new session, use bus_spawn_worker(name, brief).
+  It generates a self-contained brief and returns spawn_task arguments.
+  After calling it, run spawn_task with those args. The user clicks the
+  chip to actually start the worker. Do NOT write spawn_task briefs by
+  hand — bus_spawn_worker bakes in the bus protocol for you.
+
+• To message an existing live session, use bus_send(to, kind, body).
+  Run bus_peers() first to see who is alive (peers with alive: true
+  can be messaged; alive: false are dead windows — spawn a new one).
+
+• Incoming mail is delivered automatically. The UserPromptSubmit and
+  Stop hooks read your inbox and inject the message bodies inline as
+  system-reminders. You normally do NOT need to call bus_inbox — the
+  content is already in your context. Use bus_inbox(peek: true) only
+  for debugging or to re-read.
+
+• Push works: when a message arrives while you are idle, the Stop
+  hook wakes you within ~3s. You do not need the user to nudge you.
+
+• When replying to a specific message, set reply_to: <message-id> on
+  your bus_send. Keeps threads matchable for the recipient.
+
+• If a worker should stay alive after its first task to handle
+  follow-ups, pass long_running: true to bus_spawn_worker.`;
+
+// Self-contained brief generator for bus_spawn_worker. The worker session
+// has no memory of the orchestrator, so the brief teaches it the bus
+// protocol from cold.
+function buildWorkerBrief({ workerName, orchestratorName, userBrief, longRunning }) {
+  const reportingLine = longRunning
+    ? `When you finish each task, call bus_send({to: "${orchestratorName}", kind: "result", body: "...", reply_to: <id-of-the-most-recent-brief-from-${orchestratorName}>}). Then call bus_inbox() and wait for follow-up messages — stay open indefinitely until ${orchestratorName} explicitly tells you to stop.`
+    : `When done, call bus_send({to: "${orchestratorName}", kind: "result", body: "...", reply_to: <id-of-the-brief-message-that-told-you-what-to-do>}). After that you may close.`;
+
+  return `You are a worker session on claude-bus. Your name is "${workerName}". Your orchestrator is "${orchestratorName}".
+
+First two actions (in order):
+  1. Call bus_claim({name: "${workerName}"}) to register your inbox.
+  2. Call bus_inbox() to confirm the inbox is empty (or to pick up any pre-staged briefs from ${orchestratorName}).
+
+Your task:
+
+${userBrief}
+
+How to report back:
+${reportingLine}
+
+If your result is larger than ~1KB, write it to a file under /tmp/${workerName}-*.{md,json} and put the path plus a short summary in the body of your bus_send.
+
+If you have a blocking question, send kind: "question" to ${orchestratorName} with your question. Their reply will arrive automatically (push hook wakes you).
+
+Important: do not assume anything not stated above. The orchestrator has no memory of you and you have no memory of them — the bus is your only channel.`;
+}
+
 // Best-effort cleanup of stale entries from ended sessions.
 try { pruneStaleActive(); } catch {}
 
@@ -119,6 +177,54 @@ const TOOLS = [
     },
   },
   {
+    name: "bus_spawn_worker",
+    description:
+      "Generate a self-contained brief for a new worker session and " +
+      "return spawn_task arguments ready to invoke. After calling this, " +
+      "you should call spawn_task with the title/prompt/tldr from the " +
+      "response. The generated brief includes the bus protocol baked in " +
+      "(claim identity, do the work, send result back to you with " +
+      "reply_to set), so you do not need to write that boilerplate. " +
+      "Set long_running: true if the worker should stay open after its " +
+      "first reply to handle follow-up messages from you.",
+    inputSchema: {
+      type: "object",
+      required: ["name", "brief"],
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Bus name for the worker (e.g. 'impact-analyzer'). 1-64 chars, " +
+            "[a-zA-Z0-9_-] only. Choose something descriptive — this is " +
+            "how you address the worker.",
+        },
+        brief: {
+          type: "string",
+          description:
+            "Plain-English description of what the worker should do. " +
+            "Be specific (file paths, dataset names, expected output " +
+            "format). The worker has no memory of you — include " +
+            "everything needed to act cold.",
+        },
+        title: {
+          type: "string",
+          description:
+            "Optional short title for the spawn_task chip. Defaults to " +
+            "'Spawn <name> worker' if omitted.",
+        },
+        long_running: {
+          type: "boolean",
+          description:
+            "If true, the worker stays open after its first reply and " +
+            "calls bus_inbox in a loop to handle follow-ups. Defaults to " +
+            "false (one-shot worker).",
+          default: false,
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "bus_peers",
     description:
       "List every session known to the bus, with liveness and unread " +
@@ -132,7 +238,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.2.0" },
+  { name: "claude-bus", version: "0.3.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -155,6 +261,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               null, 2
             ),
           },
+          { type: "text", text: PROTOCOL_PRIMER },
         ],
       };
     } catch (err) {
@@ -173,6 +280,59 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
   try {
+    if (name === "bus_spawn_worker") {
+      const workerName = args.name;
+      const userBrief = args.brief;
+      const longRunning = !!args.long_running;
+      const title = args.title || `Spawn ${workerName} worker`;
+
+      if (typeof workerName !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(workerName)) {
+        throw new Error(
+          `invalid worker name "${workerName}": must be 1-64 chars, [a-zA-Z0-9_-] only`
+        );
+      }
+      if (typeof userBrief !== "string" || userBrief.trim().length < 10) {
+        throw new Error("brief must be a non-empty string of at least 10 chars");
+      }
+      if (title.length > 60) {
+        throw new Error("title must be ≤60 chars");
+      }
+
+      const prompt = buildWorkerBrief({
+        workerName,
+        orchestratorName: SELF,
+        userBrief,
+        longRunning,
+      });
+
+      const tldr =
+        `Spawns "${workerName}" worker on claude-bus. ` +
+        (longRunning
+          ? `Stays open for follow-ups from ${SELF}.`
+          : `One-shot — replies once and may close.`);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: true,
+                worker_name: workerName,
+                long_running: longRunning,
+                spawn_task_args: { title, tldr, prompt },
+                next_step:
+                  "Call spawn_task with the title, tldr, and prompt above. " +
+                  "The user will see a chip and click to start the worker. " +
+                  `When the worker reports back, the message will appear in your inbox automatically (you are "${SELF}").`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
     if (name === "bus_send") {
       const msg = await appendMessage({
         from: SELF,

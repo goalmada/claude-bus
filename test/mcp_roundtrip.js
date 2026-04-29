@@ -63,7 +63,7 @@ const assert = (cond, msg) => {
 // 1. List tools.
 const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
-assert(JSON.stringify(names) === JSON.stringify(["bus_claim","bus_inbox","bus_peers","bus_send"]),
+assert(JSON.stringify(names) === JSON.stringify(["bus_claim","bus_inbox","bus_peers","bus_send","bus_spawn_worker"]),
   `tools listed: ${names.join(",")}`);
 
 // 2. Auditor sends a brief to tester-1.
@@ -113,6 +113,57 @@ assert(testerPeer && testerPeer.alive === true,
   `tester-1 alive=${testerPeer?.alive}`);
 assert(typeof testerPeer.unread === "number",
   "tester-1 has unread count");
+
+// 7. bus_spawn_worker prepares spawn_task args from a plain brief.
+const sw = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "impact-analyzer",
+    brief: "Run a Spearman correlation between cb_post_views.impact_score and view counts. Report findings.",
+    long_running: false,
+  },
+});
+const swPayload = JSON.parse(sw.result.content[0].text);
+assert(swPayload.ok === true, "bus_spawn_worker ok");
+assert(swPayload.worker_name === "impact-analyzer", "worker_name preserved");
+assert(swPayload.spawn_task_args.title.includes("impact-analyzer"), "title generated");
+assert(swPayload.spawn_task_args.prompt.includes('bus_claim({name: "impact-analyzer"})'),
+  "brief instructs worker to claim its name");
+assert(swPayload.spawn_task_args.prompt.includes('bus_send({to: "auditor"'),
+  "brief instructs worker to reply to auditor (the orchestrator)");
+assert(swPayload.spawn_task_args.prompt.includes("Spearman correlation"),
+  "user brief embedded verbatim");
+assert(typeof swPayload.spawn_task_args.tldr === "string" && swPayload.spawn_task_args.tldr.length > 0,
+  "tldr generated");
+
+// 8. long_running flag changes the reporting language.
+const sw2 = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "watcher",
+    brief: "Watch the build status and ping me when state changes.",
+    long_running: true,
+  },
+});
+const sw2Payload = JSON.parse(sw2.result.content[0].text);
+assert(sw2Payload.long_running === true, "long_running flag preserved");
+assert(sw2Payload.spawn_task_args.prompt.includes("stay open indefinitely"),
+  "long-running brief tells worker to stay open");
+
+// 9. Invalid worker name is rejected.
+const swBad = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: { name: "../evil", brief: "do something malicious here" },
+});
+assert(swBad.result.isError === true, "invalid worker name rejected");
+
+// 10. bus_claim response includes the protocol primer.
+const claim2 = await tester.call("tools/call", {
+  name: "bus_claim", arguments: { name: "tester-1" },
+});
+const primerText = claim2.result.content[1]?.text ?? "";
+assert(primerText.includes("bus_spawn_worker"),
+  "claim response includes protocol primer");
 
 auditor.proc.kill();
 tester.proc.kill();
