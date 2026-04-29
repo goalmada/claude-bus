@@ -47,9 +47,8 @@ Register the MCP server at user scope (one time):
 claude mcp add -s user claude-bus node "$HOME/Desktop/claude-bus/src/server.js"
 ```
 
-Add the inbox-check hook to `~/.claude/settings.json` under
-`hooks.UserPromptSubmit`. Merge it alongside any existing hooks — do not
-clobber them:
+Add the inbox-check hooks to `~/.claude/settings.json`. Merge them
+alongside any existing hooks — do not clobber them:
 
 ```json
 {
@@ -64,10 +63,30 @@ clobber them:
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/YOU/Desktop/claude-bus/hooks/wait-for-mail.sh",
+            "asyncRewake": true,
+            "rewakeMessage": "claude-bus push: ",
+            "rewakeSummary": "claude-bus mail arrived"
+          }
+        ]
+      }
     ]
   }
 }
 ```
+
+`UserPromptSubmit` surfaces unread mail at the start of every turn (in
+case you want to nudge the session). `Stop` is the real push: after
+each turn ends, an `asyncRewake` background poller waits up to 30 min
+for new mail and wakes the model the instant it arrives — so a
+coordinator that's idle while workers run will reactivate on its own.
 
 ### Setting a session's identity
 
@@ -138,10 +157,12 @@ See `examples/data-auditor.md` for a worked example.
 - **Append-only JSONL + per-reader cursor.** No locks. A reader can
   never block a writer; a crashed reader just replays from wherever it
   left off. Inspect any inbox with `cat`.
-- **No push transport.** An earlier draft used SSE for server→client
-  push; it was deleted. At human timescales (minutes, not milliseconds)
-  a hook-triggered inbox check is indistinguishable from push and is
-  dramatically simpler.
+- **Push via `asyncRewake` Stop hook.** After each turn ends, a small
+  shell poller runs in the background and wakes the model when mail
+  arrives. No long-lived daemons, no IPC server, no SSE — just a
+  shell script that sleeps in a loop and exits with code 2 when it
+  finds new bytes in the inbox file. Earlier drafts used SSE for
+  push; deleted in favor of this.
 - **No registration.** The session's `CLAUDE_BUS_NAME` *is* its inbox.
   First `bus_send` to a name creates the file.
 - **Names are trusted.** All sessions in a workflow are cooperating
