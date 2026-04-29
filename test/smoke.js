@@ -34,14 +34,20 @@ assert(inbox.messages[0].body === "run test suite A", "body roundtrips");
 inbox = await readInbox("tester-1");
 assert(inbox.messages.length === 0, "cursor advanced, no repeats");
 
-// 3. Peek does not advance.
+// 3. Peek returns full history regardless of cursor — the fix for the
+//    "Stop hook truncated my body and now I can't get the full text" bug.
 await appendMessage({ from: "auditor", to: "tester-1", kind: "brief", body: "B" });
-const peek = await readInbox("tester-1", { peek: true });
-assert(peek.messages.length === 1, "peek sees the new message");
+const peekFresh = await readInbox("tester-1", { peek: true });
+assert(peekFresh.messages.length === 2, "peek shows ALL history (consumed A + new B)");
+assert(peekFresh.messages[0].body === "run test suite A", "peek includes already-consumed first message");
+assert(peekFresh.messages[1].body === "B", "peek includes new second message");
+
 const again = await readInbox("tester-1", { peek: true });
-assert(again.messages.length === 1, "peek does not advance cursor");
+assert(again.messages.length === 2, "peek is idempotent — does not advance cursor");
+
 const real = await readInbox("tester-1");
-assert(real.messages.length === 1, "non-peek read consumes it");
+assert(real.messages.length === 1 && real.messages[0].body === "B",
+  "non-peek consume returns only unread (B), advances cursor");
 
 // 4. Unread count.
 await appendMessage({ from: "auditor", to: "tester-2", kind: "brief", body: "C" });

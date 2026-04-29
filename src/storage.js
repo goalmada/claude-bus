@@ -118,14 +118,22 @@ export async function readInbox(name, { peek = false } = {}) {
     throw err;
   }
 
-  const cursor = await readCursor(name);
-  if (cursor >= stat.size) return { messages: [], cursor };
+  // Two read modes:
+  //   peek=false (consume): only return messages past the cursor, then advance.
+  //   peek=true  (history): return EVERY message in the file from offset 0,
+  //                         do not touch the cursor. Lets the caller re-read
+  //                         messages that were already delivered (e.g. via
+  //                         the inline-body hook, which truncates bodies).
+  const startOffset = peek ? 0 : await readCursor(name);
+  if (startOffset >= stat.size) {
+    return { messages: [], cursor: peek ? 0 : startOffset };
+  }
 
   const fh = await fs.open(file, "r");
   try {
-    const len = stat.size - cursor;
+    const len = stat.size - startOffset;
     const buf = Buffer.alloc(len);
-    await fh.read(buf, 0, len, cursor);
+    await fh.read(buf, 0, len, startOffset);
     const text = buf.toString("utf8");
     const messages = text
       .split("\n")

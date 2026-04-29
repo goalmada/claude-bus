@@ -165,9 +165,12 @@ const TOOLS = [
   {
     name: "bus_inbox",
     description:
-      "Read unread messages addressed to this session and mark them read. " +
-      "Set peek=true to read without advancing the cursor (useful for " +
-      "debugging). Returns messages in delivery order.",
+      "Read messages addressed to this session. Two modes: " +
+      "peek=false (default) reads UNREAD messages and advances the " +
+      "cursor (consume). peek=true returns EVERY message ever delivered " +
+      "to this inbox from offset 0, regardless of cursor — use this to " +
+      "re-read a message whose body was truncated in a system-reminder, " +
+      "or to inspect history. peek does not modify the cursor.",
     inputSchema: {
       type: "object",
       properties: {
@@ -238,7 +241,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.3.0" },
+  { name: "claude-bus", version: "0.3.1" },
   { capabilities: { tools: {} } }
 );
 
