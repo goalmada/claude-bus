@@ -64,8 +64,8 @@ const assert = (cond, msg) => {
 const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
 const expectedTools = [
-  "bus_claim", "bus_inbox", "bus_peers", "bus_send",
-  "bus_spawn_worker", "bus_task", "bus_tasks",
+  "bus_claim", "bus_inbox", "bus_peers", "bus_revive",
+  "bus_send", "bus_spawn_worker", "bus_task", "bus_tasks",
 ];
 assert(JSON.stringify(names) === JSON.stringify(expectedTools),
   `tools listed: ${names.join(",")}`);
@@ -77,6 +77,10 @@ const sendRes = await auditor.call("tools/call", {
 });
 const sendPayload = JSON.parse(sendRes.result.content[0].text);
 assert(sendPayload.ok === true, "send returned ok");
+assert(sendPayload.recipient_alive === true,
+  `send to live tester-1 reports alive: actual=${sendPayload.recipient_alive}`);
+assert(sendPayload.warning === undefined,
+  "no warning when recipient is alive");
 const briefId = sendPayload.id;
 assert(typeof briefId === "string", `brief id = ${briefId}`);
 
@@ -275,6 +279,118 @@ const stealAttempt = await stranger.call("tools/call", {
 assert(stealAttempt.result.isError === true,
   "non-owner cannot inspect another orchestrator's task");
 stranger.proc.kill();
+
+// 15. v0.6: long_running default is true.
+const swDefault = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "default-worker",
+    brief: "Generic task for default test, ten or more chars.",
+  },
+});
+const swDefaultPayload = JSON.parse(swDefault.result.content[0].text);
+assert(swDefaultPayload.long_running === true,
+  `long_running defaults to true: actual=${swDefaultPayload.long_running}`);
+assert(swDefaultPayload.spawn_task_args.prompt.includes("stay open indefinitely"),
+  "default brief is the long-running variant");
+
+// 16. v0.6: bus_claim for a name with an open task flips the task to claimed.
+const swClaim = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "to-be-claimed",
+    brief: "Some real task that needs at least ten chars.",
+  },
+});
+const swClaimPayload = JSON.parse(swClaim.result.content[0].text);
+const claimTaskId = swClaimPayload.task_id;
+
+// Pre-check: task starts in "spawned".
+const preClaim = await auditor.call("tools/call", {
+  name: "bus_task", arguments: { id: claimTaskId },
+});
+assert(JSON.parse(preClaim.result.content[0].text).status === "spawned",
+  "task starts in 'spawned' state");
+
+// Have a fresh session claim that name.
+const claimer = startSession("claimer-init");
+await claimer.init();
+const claimResp = await claimer.call("tools/call", {
+  name: "bus_claim", arguments: { name: "to-be-claimed" },
+});
+const claimPayload = JSON.parse(claimResp.result.content[0].text);
+assert(claimPayload.claimed_task && claimPayload.claimed_task.id === claimTaskId,
+  "bus_claim response surfaces the matched task");
+
+// Wait for filesystem flush, then verify status flipped.
+await new Promise((r) => setTimeout(r, 50));
+const postClaim = await auditor.call("tools/call", {
+  name: "bus_task", arguments: { id: claimTaskId },
+});
+const postClaimTask = JSON.parse(postClaim.result.content[0].text);
+assert(postClaimTask.status === "claimed",
+  `task flipped to 'claimed' after bus_claim: actual=${postClaimTask.status}`);
+assert(typeof postClaimTask.claimed_at === "string",
+  "claimed_at timestamp recorded");
+
+claimer.proc.kill();
+
+// 17. v0.6: bus_send to a non-existent / dead recipient surfaces
+//     recipient_alive: false plus a warning pointing at bus_revive.
+const ghostSend = await auditor.call("tools/call", {
+  name: "bus_send",
+  arguments: { to: "ghost-worker", kind: "brief", body: "are you there?" },
+});
+const ghostPayload = JSON.parse(ghostSend.result.content[0].text);
+assert(ghostPayload.ok === true, "send to dead recipient still succeeds (queues)");
+assert(ghostPayload.recipient_alive === false,
+  "recipient_alive: false for dead/missing peer");
+assert(typeof ghostPayload.warning === "string" &&
+       ghostPayload.warning.includes("bus_revive"),
+  "warning points at bus_revive");
+
+// 18. v0.6: bus_revive generates spawn_task args that re-claim the name
+//     and instruct the new session to read inbox history as context.
+const revive = await auditor.call("tools/call", {
+  name: "bus_revive", arguments: { name: "ghost-worker" },
+});
+const revivePayload = JSON.parse(revive.result.content[0].text);
+assert(revivePayload.ok === true, "bus_revive ok");
+assert(revivePayload.target_name === "ghost-worker", "target_name preserved");
+assert(revivePayload.target_was_alive === false,
+  "ghost-worker correctly reported as not alive");
+assert(revivePayload.spawn_task_args.prompt.includes('bus_claim({name: "ghost-worker"})'),
+  "revive brief tells new session to re-claim same name");
+assert(revivePayload.spawn_task_args.prompt.includes("bus_inbox({peek: true})"),
+  "revive brief tells new session to peek inbox history");
+assert(revivePayload.spawn_task_args.title === "Revive ghost-worker",
+  "chip title reflects the operation");
+
+// 19. v0.6: bus_revive with follow_up embeds it in the brief.
+const reviveWithFollow = await auditor.call("tools/call", {
+  name: "bus_revive",
+  arguments: {
+    name: "ghost-worker",
+    follow_up: "We discovered the build is also failing on macOS — please check that path too.",
+  },
+});
+const followPayload = JSON.parse(reviveWithFollow.result.content[0].text);
+assert(followPayload.spawn_task_args.prompt.includes("build is also failing on macOS"),
+  "follow_up embedded in revive brief");
+
+// 20. v0.6: invalid name on bus_revive is rejected.
+//
+// (Note: a check for "revive on already-alive name flags target_was_alive"
+// would be ideal here, but in this test harness multiple "sessions" share
+// the test process's ppid and overwrite each other's active/ entries,
+// so liveness lookups for parallel sessions are unreliable. The
+// production case — each Claude Code session has its own ppid — is
+// covered indirectly by test 17, which exercises the dead-recipient
+// path that bus_revive is meant to recover from.)
+const reviveBad = await auditor.call("tools/call", {
+  name: "bus_revive", arguments: { name: "../evil" },
+});
+assert(reviveBad.result.isError === true, "invalid revive name rejected");
 
 // 10. bus_claim response includes the protocol primer.
 const claim2 = await tester.call("tools/call", {

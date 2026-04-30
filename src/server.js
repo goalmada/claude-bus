@@ -24,6 +24,8 @@ import {
   createTask,
   getTask,
   listTasks,
+  markTasksClaimedFor,
+  isPeerAlive,
   MAX_BODY_BYTES,
 } from "./storage.js";
 
@@ -95,9 +97,27 @@ const PROTOCOL_PRIMER = `You are now identified on claude-bus. Quick protocol:
   the template; that's the fallback for off-format drift.
 
 • Every bus_spawn_worker call records a task entry. Use bus_tasks() to
-  see what's outstanding ("spawned") vs done ("reported") and bus_task
-  (id) for full detail. The registry survives context compaction — if
-  your memory of the fan-out gets trimmed, bus_tasks() recovers it.`;
+  see what's outstanding and bus_task(id) for full detail. The registry
+  survives context compaction — if your memory of the fan-out gets
+  trimmed, bus_tasks() recovers it. Lifecycle states:
+    spawned  — chip created, no worker has claimed the name yet (the
+               user may not have clicked the chip; if it stays in this
+               state past a few minutes, re-issue or assume stuck)
+    claimed  — a worker session has claimed the name (chip clicked,
+               worker is alive and working)
+    reported — worker bus_sent a kind: "result" with the matching TASK ID
+
+• bus_send returns recipient_alive in its response. If recipient_alive
+  is false, the message is QUEUED in a dead inbox — nobody will read it.
+  Do not assume delivery means processing. The right response is
+  bus_revive(name) which spawns a fresh session that re-claims the
+  same name and reads the prior inbox history as context. Do NOT spawn
+  a new differently-named worker — reusing the name preserves the
+  conversation thread and keeps session count minimum.
+
+• Workers default to long_running: true so they stay alive after their
+  first reply and remain reachable for follow-ups. Pass long_running:
+  false explicitly only for genuinely one-shot work.`;
 
 // Strict report template every worker uses for its result body. Stamping
 // structure at message-creation time means the orchestrator surfaces
@@ -263,10 +283,15 @@ const TOOLS = [
         long_running: {
           type: "boolean",
           description:
-            "If true, the worker stays open after its first reply and " +
-            "calls bus_inbox in a loop to handle follow-ups. Defaults to " +
-            "false (one-shot worker).",
-          default: false,
+            "If true (the default), the worker stays open after its " +
+            "first reply and listens for follow-ups indefinitely. The " +
+            "orchestrator can then bus_send additional tasks to the " +
+            "same name — same context, same session, no new chip. " +
+            "Pass false ONLY for genuinely one-shot work where you " +
+            "will never need to follow up. Default flipped to true in " +
+            "v0.6 because dead-worker recovery is more painful than a " +
+            "long-lived session.",
+          default: true,
         },
         report_to: {
           type: "array",
@@ -277,6 +302,39 @@ const TOOLS = [
             "orchestrator). Use this to CC results to an audit session, " +
             "another orchestrator, or a logger — e.g. " +
             "report_to: ['orchestrator', 'data-auditor'].",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bus_revive",
+    description:
+      "Generate spawn_task arguments to revive a dead session. Use " +
+      "this when you discover a recipient is no longer alive (via " +
+      "recipient_alive: false in a bus_send response, or alive: false " +
+      "in bus_peers). The generated brief tells the new session to " +
+      "re-claim the SAME name and read its prior inbox history as " +
+      "context, so the conversation thread continues without you " +
+      "having to spawn a new differently-named worker. Optionally pass " +
+      "a short follow_up message that should also be communicated to " +
+      "the reborn session (in addition to whatever was queued).",
+    inputSchema: {
+      type: "object",
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Name of the session to revive. Must be a name you previously " +
+            "communicated with (i.e. that has an inbox or active claim).",
+        },
+        follow_up: {
+          type: "string",
+          description:
+            "Optional plain-English instruction to surface to the reborn " +
+            "session in addition to whatever was queued. Use this when " +
+            "you have new context the worker didn't have before dying.",
         },
       },
       additionalProperties: false,
@@ -335,7 +393,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.5.0" },
+  { name: "claude-bus", version: "0.6.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -349,12 +407,25 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     try {
       setActiveIdentity(process.ppid, args.name);
       _selfClaimed = args.name;
+      // If this claim resolves an outstanding "spawned" task (i.e. the
+      // user just clicked a chip we issued), flip its lifecycle to
+      // "claimed" so the spawning orchestrator can see the worker is
+      // actually alive and working.
+      let claimedTask = null;
+      try { claimedTask = await markTasksClaimedFor(args.name); } catch {}
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify(
-              { ok: true, identity: args.name, ppid: process.ppid },
+              {
+                ok: true,
+                identity: args.name,
+                ppid: process.ppid,
+                claimed_task: claimedTask
+                  ? { id: claimedTask.id, owner: claimedTask.owner }
+                  : null,
+              },
               null, 2
             ),
           },
@@ -380,7 +451,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "bus_spawn_worker") {
       const workerName = args.name;
       const userBrief = args.brief;
-      const longRunning = !!args.long_running;
+      // Default flipped to true in v0.6: workers stay alive unless the
+      // caller explicitly opts out.
+      const longRunning = args.long_running === false ? false : true;
       const title = args.title || `Spawn ${workerName} worker`;
       const reportTo = Array.isArray(args.report_to) && args.report_to.length > 0
         ? args.report_to
@@ -467,17 +540,29 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         reply_to: args.reply_to ?? null,
         body: args.body,
       });
+      // Liveness probe AFTER the send. We don't want to refuse delivery
+      // (queueing for a not-yet-claimed name is a legitimate pattern),
+      // but the orchestrator needs to KNOW when its message landed in
+      // a dead inbox so it can decide to bus_revive instead of waiting.
+      const recipient_alive = await isPeerAlive(args.to);
+      const response = {
+        ok: true,
+        id: msg.id,
+        delivered_at: msg.created_at,
+        recipient_alive,
+      };
+      if (!recipient_alive) {
+        response.warning =
+          `Recipient "${args.to}" is not currently alive on the bus. ` +
+          `The message is queued but nobody is listening. The right ` +
+          `response is to call bus_revive({name: "${args.to}"}) which ` +
+          `respawns a session that re-claims this name and reads the ` +
+          `prior inbox history as context. Do NOT spawn a new ` +
+          `differently-named worker — reusing the name preserves the ` +
+          `conversation thread.`;
+      }
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { ok: true, id: msg.id, delivered_at: msg.created_at },
-              null,
-              2
-            ),
-          },
-        ],
+        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
       };
     }
     if (name === "bus_inbox") {
@@ -487,6 +572,70 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           {
             type: "text",
             text: JSON.stringify({ self: SELF, messages }, null, 2),
+          },
+        ],
+      };
+    }
+    if (name === "bus_revive") {
+      const targetName = args.name;
+      const followUp = (args.follow_up || "").trim();
+      if (typeof targetName !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(targetName)) {
+        throw new Error(
+          `invalid name "${targetName}": must be 1-64 chars, [a-zA-Z0-9_-] only`
+        );
+      }
+      const stillAlive = await isPeerAlive(targetName);
+      const followUpBlock = followUp
+        ? `\n\nFollow-up note from ${SELF} (use this in addition to the inbox history):\n${followUp}\n`
+        : "";
+
+      const prompt = `You are a reborn session on claude-bus. The previous session that held the name "${targetName}" is no longer alive — you are taking over that identity. Your orchestrator is "${SELF}".
+
+First two actions (in order):
+  1. Call bus_claim({name: "${targetName}"}) to take over the name.
+  2. Call bus_inbox({peek: true}) to read the FULL history of messages
+     ever sent to "${targetName}". This is your context — the prior
+     conversation thread between you and ${SELF} is in those messages.
+     Read them in chronological order to understand what was being
+     worked on, what was already discussed, and what's still pending.
+
+After that, call bus_inbox() (without peek) to consume the unread queue
+and process whatever messages were waiting for you when the previous
+session died.${followUpBlock}
+
+When you reply, use the same protocol you would as any worker — REPORT
+template for results, or kind: "question" for blocking questions.
+
+Important: do NOT pretend to be the prior session. You don't have its
+local conversation transcript, only the bus history. If something in
+the history is unclear, send kind: "question" to ${SELF} for
+clarification rather than guessing. This is a continuity hand-off, not
+a memory restore.`;
+
+      const tldr = stillAlive
+        ? `Note: "${targetName}" appears to be alive already. Reviving anyway will create a second claimant. You probably want to bus_send instead.`
+        : `Revives the dead "${targetName}" session by spawning a fresh worker that re-claims the name and reads inbox history as context.`;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: true,
+                target_name: targetName,
+                target_was_alive: stillAlive,
+                spawn_task_args: {
+                  title: `Revive ${targetName}`,
+                  tldr,
+                  prompt,
+                },
+                next_step:
+                  `Call spawn_task with the spawn_task_args above. The user clicks the chip; the new session re-claims "${targetName}" and reads inbox history as context. Any messages already queued in the inbox will be processed.`,
+              },
+              null,
+              2
+            ),
           },
         ],
       };

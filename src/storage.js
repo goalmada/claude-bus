@@ -395,6 +395,75 @@ export async function markTaskReported(id, result_message_id) {
   return task;
 }
 
+// When a session calls bus_claim, look for matching open tasks (tasks
+// where worker_name == this name AND status == "spawned") and flip them
+// to "claimed". This distinguishes "chip not yet clicked" from
+// "worker is alive and working." Idempotent: tasks already claimed or
+// reported are left alone. We update at most one task per call (the
+// most recently spawned matching one) — multiple simultaneous tasks
+// for the same worker name are an orchestrator hygiene problem, not
+// something this layer resolves.
+export async function markTasksClaimedFor(workerName) {
+  let entries;
+  try {
+    entries = await fs.readdir(TASKS_DIR);
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+
+  // Find the most recently-spawned matching task.
+  let best = null;
+  for (const f of entries) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const raw = await fs.readFile(path.join(TASKS_DIR, f), "utf8");
+      const t = JSON.parse(raw);
+      if (t.worker_name !== workerName) continue;
+      if (t.status !== "spawned") continue;
+      if (!best || t.spawned_at > best.spawned_at) best = t;
+    } catch {
+      // skip
+    }
+  }
+  if (!best) return null;
+
+  best.status = "claimed";
+  best.claimed_at = new Date().toISOString();
+  await fs.writeFile(taskPath(best.id), JSON.stringify(best, null, 2), "utf8");
+  return best;
+}
+
+// True if at least one Claude Code session is currently holding `name`
+// on the bus. Used by bus_send to surface dead-recipient warnings.
+export async function isPeerAlive(name) {
+  let entries;
+  try {
+    entries = await fs.readdir(ACTIVE_DIR);
+  } catch (err) {
+    if (err.code === "ENOENT") return false;
+    throw err;
+  }
+  for (const f of entries) {
+    if (!f.endsWith(".txt")) continue;
+    const pid = parseInt(f.slice(0, -4), 10);
+    if (!Number.isFinite(pid)) continue;
+    try {
+      const owner = (await fs.readFile(path.join(ACTIVE_DIR, f), "utf8")).trim();
+      if (owner !== name) continue;
+      try {
+        process.kill(pid, 0);
+        return true; // PID is alive
+      } catch (err) {
+        if (err.code !== "ESRCH") return true; // EPERM = exists, not ours
+      }
+    } catch {
+      // skip
+    }
+  }
+  return false;
+}
+
 export async function listTasks({ owner, status } = {}) {
   let entries;
   try {

@@ -149,10 +149,13 @@ orchestrator reformat afterwards" approach found Option-1 wins on cost
 obviously — proactive next-steps quality. See commit history for the
 full comparison.
 
-Pass `long_running: true` for workers that should stay open after
-their first reply to handle follow-ups. Pass `report_to: ["a", "b"]`
-to CC the structured report to additional sessions (default: just
-the calling orchestrator).
+`long_running` defaults to `true` — workers stay open after their
+first reply and listen for follow-ups indefinitely. The orchestrator
+can `bus_send` additional tasks to the same name without re-spawning.
+Pass `long_running: false` only for genuinely one-shot work where you
+will never need to follow up. Pass `report_to: ["a", "b"]` to CC the
+structured report to additional sessions (default: just the calling
+orchestrator).
 
 Typical use:
 ```
@@ -185,10 +188,28 @@ Filter by `status: "spawned" | "reported" | "all"` (default `"all"`).
 Full detail for a specific task by id. Only the owning orchestrator
 can read its own tasks.
 
+### `bus_revive(name, follow_up?)`
+When a recipient is dead (Claude Code window closed, Cmd+Q'd, app
+restarted), use this to bring it back without losing the conversation
+thread. Returns `spawn_task` arguments for a fresh session that
+re-claims the *same* name and reads its prior inbox history as
+context. Optional `follow_up` is a plain-English instruction
+appended to the brief (use this when you have new context the worker
+didn't have before dying).
+
+The reborn session doesn't have the dead process's local conversation
+transcript, but it has the entire bus history of messages to/from
+that name — which is the load-bearing context for most
+bus-coordinated workflows. This keeps the session count minimum: one
+"deployer-2" reborn vs. two-or-three differently-named workers.
+
 ### `bus_send(to, kind, body, reply_to?)`
 Appends a message to the recipient's inbox. Returns `{ok, id,
-delivered_at}`. Body capped at 8 KB — for larger payloads, write to a
-file and send the path plus a summary.
+delivered_at, recipient_alive}`. If `recipient_alive` is `false`, the
+response also includes a `warning` pointing at `bus_revive` — the
+message is queued in a dead inbox and nobody will read it until the
+name is re-claimed. Body capped at 8 KB — for larger payloads, write
+to a file and send the path plus a summary.
 
 ### `bus_inbox(peek?)`
 Returns unread messages for *this* session and advances the cursor.

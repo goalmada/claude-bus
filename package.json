@@ -1,6 +1,6 @@
 {
   "name": "claude-bus",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A tiny MCP server that lets Claude Code sessions send each other messages through shared inboxes.",
   "type": "module",
   "bin": {
