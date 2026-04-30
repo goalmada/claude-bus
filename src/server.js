@@ -82,15 +82,41 @@ const PROTOCOL_PRIMER = `You are now identified on claude-bus. Quick protocol:
   your bus_send. Keeps threads matchable for the recipient.
 
 • If a worker should stay alive after its first task to handle
-  follow-ups, pass long_running: true to bus_spawn_worker.`;
+  follow-ups, pass long_running: true to bus_spawn_worker.
+
+• Workers report back in a strict template (REPORT FROM / CONTEXT / WHY
+  / PROBLEM / SOLUTION / STATUS / NOTES / NEXT STEPS). When you surface
+  a worker result to the user, pass it through faithfully — it is
+  already in the right shape. ONLY if a result body does not begin with
+  "REPORT FROM:" should you reformat it into the template before
+  showing the user; this is a fallback for the rare case a worker
+  drifts off-format.`;
+
+// Strict report template every worker uses for its result body. Stamping
+// structure at message-creation time means the orchestrator surfaces
+// reports faithfully (no LLM reformat round-trip), inbox files are
+// already structured (cat-friendly logs), and asking the worker to fill
+// in NEXT STEPS makes the worker actually think about them.
+const REPORT_TEMPLATE = `REPORT FROM: <your-name>
+CONTEXT: <one line — what this work was about>
+WHY: <one line — why we did it>
+PROBLEM: <one line — what was actually broken/unknown going in>
+SOLUTION: <one line — what you did to address it>
+STATUS: <one line — done | partial | blocked + reason>
+NOTES: <0-2 lines — anything the orchestrator should know that doesn't fit above>
+NEXT STEPS: <one line per concrete next action, dash-prefixed>`;
 
 // Self-contained brief generator for bus_spawn_worker. The worker session
 // has no memory of the orchestrator, so the brief teaches it the bus
 // protocol from cold.
-function buildWorkerBrief({ workerName, orchestratorName, userBrief, longRunning }) {
+function buildWorkerBrief({ workerName, orchestratorName, userBrief, longRunning, reportTo }) {
+  const recipients = reportTo.length === 1
+    ? `to: "${reportTo[0]}"`
+    : `to each of these recipients in turn: ${reportTo.map((r) => `"${r}"`).join(", ")} (one bus_send per recipient, identical body)`;
+
   const reportingLine = longRunning
-    ? `When you finish each task, call bus_send({to: "${orchestratorName}", kind: "result", body: "...", reply_to: <id-of-the-most-recent-brief-from-${orchestratorName}>}). Then call bus_inbox() and wait for follow-up messages — stay open indefinitely until ${orchestratorName} explicitly tells you to stop.`
-    : `When done, call bus_send({to: "${orchestratorName}", kind: "result", body: "...", reply_to: <id-of-the-brief-message-that-told-you-what-to-do>}). After that you may close.`;
+    ? `When you finish each task, send your result ${recipients} with kind: "result", reply_to: <id-of-the-most-recent-brief-you-received>, and a body formatted EXACTLY as the REPORT TEMPLATE below. Then call bus_inbox() and wait for follow-up messages — stay open indefinitely until "${orchestratorName}" explicitly tells you to stop.`
+    : `When done, send your result ${recipients} with kind: "result", reply_to: <id-of-the-brief-message-that-told-you-what-to-do>, and a body formatted EXACTLY as the REPORT TEMPLATE below. After that you may close.`;
 
   return `You are a worker session on claude-bus. Your name is "${workerName}". Your orchestrator is "${orchestratorName}".
 
@@ -105,9 +131,13 @@ ${userBrief}
 How to report back:
 ${reportingLine}
 
-If your result is larger than ~1KB, write it to a file under /tmp/${workerName}-*.{md,json} and put the path plus a short summary in the body of your bus_send.
+REPORT TEMPLATE (use this verbatim for your result body — fill in each field, do not omit any section, write "n/a" if a section truly does not apply):
 
-If you have a blocking question, send kind: "question" to ${orchestratorName} with your question. Their reply will arrive automatically (push hook wakes you).
+${REPORT_TEMPLATE}
+
+If your result is larger than ~6KB even after fitting the template, write the detail to a file under /tmp/${workerName}-*.{md,json} and put the path in NOTES with a one-line summary in SOLUTION.
+
+If you have a blocking question, send kind: "question" to ${orchestratorName} with your question (free-form body — the template only applies to "result" kind). Their reply will arrive automatically (push hook wakes you).
 
 Important: do not assume anything not stated above. The orchestrator has no memory of you and you have no memory of them — the bus is your only channel.`;
 }
@@ -185,11 +215,12 @@ const TOOLS = [
       "Generate a self-contained brief for a new worker session and " +
       "return spawn_task arguments ready to invoke. After calling this, " +
       "you should call spawn_task with the title/prompt/tldr from the " +
-      "response. The generated brief includes the bus protocol baked in " +
-      "(claim identity, do the work, send result back to you with " +
-      "reply_to set), so you do not need to write that boilerplate. " +
-      "Set long_running: true if the worker should stay open after its " +
-      "first reply to handle follow-up messages from you.",
+      "response. The generated brief bakes in the bus protocol (claim, " +
+      "do the work, report back) AND a strict report template so the " +
+      "worker's result is already structured when it lands in your " +
+      "inbox. Use long_running: true for workers that should stay open " +
+      "for follow-ups. Use report_to to CC the structured report to " +
+      "additional sessions (e.g. an audit/log session).",
     inputSchema: {
       type: "object",
       required: ["name", "brief"],
@@ -223,6 +254,16 @@ const TOOLS = [
             "false (one-shot worker).",
           default: false,
         },
+        report_to: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional list of session names to send the structured " +
+            "report to. Defaults to [<your-name>] (i.e. just the calling " +
+            "orchestrator). Use this to CC results to an audit session, " +
+            "another orchestrator, or a logger — e.g. " +
+            "report_to: ['orchestrator', 'data-auditor'].",
+        },
       },
       additionalProperties: false,
     },
@@ -241,7 +282,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.3.2" },
+  { name: "claude-bus", version: "0.4.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -288,6 +329,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const userBrief = args.brief;
       const longRunning = !!args.long_running;
       const title = args.title || `Spawn ${workerName} worker`;
+      const reportTo = Array.isArray(args.report_to) && args.report_to.length > 0
+        ? args.report_to
+        : [SELF];
 
       if (typeof workerName !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(workerName)) {
         throw new Error(
@@ -300,19 +344,31 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (title.length > 60) {
         throw new Error("title must be ≤60 chars");
       }
+      for (const r of reportTo) {
+        if (typeof r !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(r)) {
+          throw new Error(
+            `invalid report_to entry "${r}": must be 1-64 chars, [a-zA-Z0-9_-] only`
+          );
+        }
+      }
 
       const prompt = buildWorkerBrief({
         workerName,
         orchestratorName: SELF,
         userBrief,
         longRunning,
+        reportTo,
       });
 
+      const ccLine = reportTo.length > 1
+        ? ` Reports CC'd to: ${reportTo.join(", ")}.`
+        : "";
       const tldr =
         `Spawns "${workerName}" worker on claude-bus. ` +
         (longRunning
           ? `Stays open for follow-ups from ${SELF}.`
-          : `One-shot — replies once and may close.`);
+          : `One-shot — replies once and may close.`) +
+        ccLine;
 
       return {
         content: [
@@ -323,11 +379,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
                 ok: true,
                 worker_name: workerName,
                 long_running: longRunning,
+                report_to: reportTo,
                 spawn_task_args: { title, tldr, prompt },
                 next_step:
                   "Call spawn_task with the title, tldr, and prompt above. " +
                   "The user will see a chip and click to start the worker. " +
-                  `When the worker reports back, the message will appear in your inbox automatically (you are "${SELF}").`,
+                  `When the worker reports back, the message will appear in ${reportTo.length === 1 ? `your inbox ("${reportTo[0]}")` : `the inboxes of: ${reportTo.join(", ")}`} automatically. The report body uses a strict template (REPORT FROM / CONTEXT / WHY / PROBLEM / SOLUTION / STATUS / NOTES / NEXT STEPS) — surface it to the user as-is unless it drifted off-format.`,
               },
               null,
               2

@@ -129,7 +129,7 @@ assert(swPayload.worker_name === "impact-analyzer", "worker_name preserved");
 assert(swPayload.spawn_task_args.title.includes("impact-analyzer"), "title generated");
 assert(swPayload.spawn_task_args.prompt.includes('bus_claim({name: "impact-analyzer"})'),
   "brief instructs worker to claim its name");
-assert(swPayload.spawn_task_args.prompt.includes('bus_send({to: "auditor"'),
+assert(swPayload.spawn_task_args.prompt.includes('to: "auditor"'),
   "brief instructs worker to reply to auditor (the orchestrator)");
 assert(swPayload.spawn_task_args.prompt.includes("Spearman correlation"),
   "user brief embedded verbatim");
@@ -156,6 +156,48 @@ const swBad = await auditor.call("tools/call", {
   arguments: { name: "../evil", brief: "do something malicious here" },
 });
 assert(swBad.result.isError === true, "invalid worker name rejected");
+
+// 9a. Report template is embedded in the brief.
+assert(swPayload.spawn_task_args.prompt.includes("REPORT FROM:"),
+  "brief includes REPORT FROM section");
+assert(swPayload.spawn_task_args.prompt.includes("NEXT STEPS:"),
+  "brief includes NEXT STEPS section");
+assert(swPayload.spawn_task_args.prompt.includes('write "n/a" if a section truly does not apply'),
+  "brief tells worker to fill every section");
+
+// 9b. report_to defaults to [SELF].
+assert(JSON.stringify(swPayload.report_to) === JSON.stringify(["auditor"]),
+  `report_to defaults to [SELF]: ${JSON.stringify(swPayload.report_to)}`);
+
+// 9c. report_to with multiple recipients changes the brief.
+const swCC = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "audited-worker",
+    brief: "Investigate the thing and report findings.",
+    report_to: ["auditor", "data-auditor", "logger"],
+  },
+});
+const swCCPayload = JSON.parse(swCC.result.content[0].text);
+assert(JSON.stringify(swCCPayload.report_to) === JSON.stringify(["auditor", "data-auditor", "logger"]),
+  "report_to preserves multi-recipient list");
+assert(swCCPayload.spawn_task_args.prompt.includes('"auditor"') &&
+       swCCPayload.spawn_task_args.prompt.includes('"data-auditor"') &&
+       swCCPayload.spawn_task_args.prompt.includes('"logger"'),
+  "multi-recipient brief lists all three names");
+assert(swCCPayload.spawn_task_args.tldr.includes("CC'd to: auditor, data-auditor, logger"),
+  "multi-recipient tldr surfaces the CC list");
+
+// 9d. Invalid report_to entry rejected.
+const swBadCC = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "x",
+    brief: "ten chars min",
+    report_to: ["valid-name", "bad name with spaces"],
+  },
+});
+assert(swBadCC.result.isError === true, "invalid report_to entry rejected");
 
 // 10. bus_claim response includes the protocol primer.
 const claim2 = await tester.call("tools/call", {

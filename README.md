@@ -121,20 +121,45 @@ Registers this session's identity. The response includes a short protocol
 primer so a freshly-started orchestrator/worker can use the bus correctly
 without coaching.
 
-### `bus_spawn_worker(name, brief, long_running?)`
+### `bus_spawn_worker(name, brief, long_running?, report_to?)`
 Generates a self-contained brief for a new worker and returns
 `spawn_task` arguments ready to invoke. The orchestrator passes plain
 English; the tool handles the bus-protocol boilerplate (claim, listen,
-reply with `reply_to` set, file output for big results). Pass
-`long_running: true` for workers that should stay open after their
-first reply to handle follow-ups.
+reply with `reply_to` set) AND injects a strict report template the
+worker fills in for its result body:
+
+```
+REPORT FROM: <worker-name>
+CONTEXT: ...
+WHY: ...
+PROBLEM: ...
+SOLUTION: ...
+STATUS: done | partial | blocked + reason
+NOTES: ...
+NEXT STEPS: - ...
+```
+
+Stamping the structure at message-creation time means inbox files are
+already structured, the orchestrator surfaces results faithfully (no
+LLM reformat round-trip), and asking the worker for NEXT STEPS makes
+it actually think about them. A bake-off against a "let the
+orchestrator reformat afterwards" approach found Option-1 wins on cost
+(2.2× cheaper), latency (1.6× faster), audit-trail quality, and — non-
+obviously — proactive next-steps quality. See commit history for the
+full comparison.
+
+Pass `long_running: true` for workers that should stay open after
+their first reply to handle follow-ups. Pass `report_to: ["a", "b"]`
+to CC the structured report to additional sessions (default: just
+the calling orchestrator).
 
 Typical use:
 ```
 bus_spawn_worker({
   name: "impact-analyzer",
   brief: "Run a Spearman correlation between cb_post_views.impact_score
-          and view counts. Report findings in the body."
+          and view counts. Report findings.",
+  report_to: ["orchestrator", "data-auditor"]   // optional
 })
 // → returns { spawn_task_args: { title, tldr, prompt } }
 // Then call spawn_task with those args. User clicks chip, worker runs.
