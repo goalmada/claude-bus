@@ -85,6 +85,77 @@ const a = await appendMessage({
 });
 assert(a.reply_to === q.id, "reply_to preserved");
 
+// 9. Task registry: createTask + listTasks + getTask round-trip.
+const { createTask, listTasks, getTask, markTaskReported } = await import(
+  "../src/storage.js"
+);
+const t1 = await createTask({
+  owner: "auditor",
+  worker_name: "impact-analyzer",
+  brief_summary: "Run the spearman correlation",
+  long_running: false,
+  report_to: ["auditor"],
+});
+assert(/^tsk-[a-z0-9-]+$/.test(t1.id), "task id has expected format");
+assert(t1.status === "spawned", "new task is in 'spawned' status");
+assert(t1.owner === "auditor", "owner preserved");
+
+await createTask({
+  owner: "different-orch",
+  worker_name: "x",
+  brief_summary: "y",
+  long_running: false,
+  report_to: ["different-orch"],
+});
+
+const myTasks = await listTasks({ owner: "auditor" });
+assert(myTasks.length === 1 && myTasks[0].id === t1.id,
+  "listTasks filters by owner");
+
+// 10. Marking a task reported is recorded and idempotent.
+const updated = await markTaskReported(t1.id, "msg-result-001");
+assert(updated.status === "reported", "status flipped to reported");
+assert(updated.first_result_id === "msg-result-001", "result id stored");
+const repeat = await markTaskReported(t1.id, "msg-result-002");
+assert(repeat.first_result_id === "msg-result-001",
+  "first-reporter-wins: idempotent on second call");
+
+// 11. bus_send with TASK ID in body auto-marks the task.
+const t2 = await createTask({
+  owner: "auditor", worker_name: "x", brief_summary: "y",
+  long_running: false, report_to: ["auditor"],
+});
+const resultMsg = await appendMessage({
+  from: "x", to: "auditor", kind: "result", reply_to: null,
+  body: `REPORT FROM: x\nTASK ID: ${t2.id}\nCONTEXT: y\n`,
+});
+const t2Updated = await getTask(t2.id);
+assert(t2Updated.status === "reported",
+  "bus_send with TASK ID line auto-marks the task");
+assert(t2Updated.first_result_id === resultMsg.id,
+  "task linked to the result message id");
+
+// 12. Non-result kinds do NOT auto-mark.
+const t3 = await createTask({
+  owner: "auditor", worker_name: "x", brief_summary: "y",
+  long_running: false, report_to: ["auditor"],
+});
+await appendMessage({
+  from: "x", to: "auditor", kind: "status", reply_to: null,
+  body: `TASK ID: ${t3.id}\nWorking on it`,
+});
+const t3Still = await getTask(t3.id);
+assert(t3Still.status === "spawned",
+  "status messages don't trigger task completion");
+
+// 13. listTasks filter by status.
+const reported = await listTasks({ owner: "auditor", status: "reported" });
+assert(reported.length === 2,
+  `reported filter: expected 2, got ${reported.length}`);
+const spawned = await listTasks({ owner: "auditor", status: "spawned" });
+assert(spawned.length === 1 && spawned[0].id === t3.id,
+  "spawned filter returns the still-pending task");
+
 await fs.rm(tmp, { recursive: true, force: true });
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

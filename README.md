@@ -130,6 +130,7 @@ worker fills in for its result body:
 
 ```
 REPORT FROM: <worker-name>
+TASK ID: tsk-...     (auto-injected; lets the bus link the result to the task)
 CONTEXT: ...
 WHY: ...
 PROBLEM: ...
@@ -164,6 +165,25 @@ bus_spawn_worker({
 // → returns { spawn_task_args: { title, tldr, prompt } }
 // Then call spawn_task with those args. User clicks chip, worker runs.
 ```
+
+### `bus_tasks(status?)`
+Lists tasks YOU spawned via `bus_spawn_worker`. Each `bus_spawn_worker`
+call records a task entry in `~/.claude-bus/tasks/<id>.json` with the
+worker name, brief summary, recipients, and status. When a worker's
+`kind: "result"` message contains a `TASK ID:` line matching a known
+task, the bus auto-flips that task's status from `"spawned"` to
+`"reported"` and stores the result message id.
+
+This is mostly useful for two situations:
+- mid-fan-out: see what's still outstanding without scrolling chat
+- post-compaction: your task registry survives even if your
+  conversation memory gets trimmed — call `bus_tasks` to recover
+
+Filter by `status: "spawned" | "reported" | "all"` (default `"all"`).
+
+### `bus_task(id)`
+Full detail for a specific task by id. Only the owning orchestrator
+can read its own tasks.
 
 ### `bus_send(to, kind, body, reply_to?)`
 Appends a message to the recipient's inbox. Returns `{ok, id,

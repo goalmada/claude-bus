@@ -21,6 +21,9 @@ import {
   setActiveIdentity,
   getActiveIdentity,
   pruneStaleActive,
+  createTask,
+  getTask,
+  listTasks,
   MAX_BODY_BYTES,
 } from "./storage.js";
 
@@ -84,20 +87,27 @@ const PROTOCOL_PRIMER = `You are now identified on claude-bus. Quick protocol:
 • If a worker should stay alive after its first task to handle
   follow-ups, pass long_running: true to bus_spawn_worker.
 
-• Workers report back in a strict template (REPORT FROM / CONTEXT / WHY
-  / PROBLEM / SOLUTION / STATUS / NOTES / NEXT STEPS). When you surface
-  a worker result to the user, pass it through faithfully — it is
-  already in the right shape. ONLY if a result body does not begin with
-  "REPORT FROM:" should you reformat it into the template before
-  showing the user; this is a fallback for the rare case a worker
-  drifts off-format.`;
+• Workers report back in a strict template (REPORT FROM / TASK ID /
+  CONTEXT / WHY / PROBLEM / SOLUTION / STATUS / NOTES / NEXT STEPS).
+  When you surface a worker result to the user, pass it through
+  faithfully — it is already in the right shape. ONLY if a result
+  body does not begin with "REPORT FROM:" should you reformat it into
+  the template; that's the fallback for off-format drift.
+
+• Every bus_spawn_worker call records a task entry. Use bus_tasks() to
+  see what's outstanding ("spawned") vs done ("reported") and bus_task
+  (id) for full detail. The registry survives context compaction — if
+  your memory of the fan-out gets trimmed, bus_tasks() recovers it.`;
 
 // Strict report template every worker uses for its result body. Stamping
 // structure at message-creation time means the orchestrator surfaces
 // reports faithfully (no LLM reformat round-trip), inbox files are
 // already structured (cat-friendly logs), and asking the worker to fill
-// in NEXT STEPS makes the worker actually think about them.
-const REPORT_TEMPLATE = `REPORT FROM: <your-name>
+// in NEXT STEPS makes the worker actually think about them. The TASK ID
+// line lets the bus auto-link the result back to the task record so the
+// orchestrator can recover state after compaction.
+const REPORT_TEMPLATE_TEMPLATE = `REPORT FROM: <your-name>
+TASK ID: <TASK_ID_PLACEHOLDER>
 CONTEXT: <one line — what this work was about>
 WHY: <one line — why we did it>
 PROBLEM: <one line — what was actually broken/unknown going in>
@@ -106,10 +116,14 @@ STATUS: <one line — done | partial | blocked + reason>
 NOTES: <0-2 lines — anything the orchestrator should know that doesn't fit above>
 NEXT STEPS: <one line per concrete next action, dash-prefixed>`;
 
+function reportTemplateFor(taskId) {
+  return REPORT_TEMPLATE_TEMPLATE.replace("<TASK_ID_PLACEHOLDER>", taskId);
+}
+
 // Self-contained brief generator for bus_spawn_worker. The worker session
 // has no memory of the orchestrator, so the brief teaches it the bus
 // protocol from cold.
-function buildWorkerBrief({ workerName, orchestratorName, userBrief, longRunning, reportTo }) {
+function buildWorkerBrief({ workerName, orchestratorName, userBrief, longRunning, reportTo, taskId }) {
   const recipients = reportTo.length === 1
     ? `to: "${reportTo[0]}"`
     : `to each of these recipients in turn: ${reportTo.map((r) => `"${r}"`).join(", ")} (one bus_send per recipient, identical body)`;
@@ -131,9 +145,9 @@ ${userBrief}
 How to report back:
 ${reportingLine}
 
-REPORT TEMPLATE (use this verbatim for your result body — fill in each field, do not omit any section, write "n/a" if a section truly does not apply):
+REPORT TEMPLATE (use this verbatim for your result body — fill in each field, do not omit any section, write "n/a" if a section truly does not apply). The TASK ID line is pre-filled with your task id; copy it as-is so the orchestrator can auto-link your reply to the task it spawned:
 
-${REPORT_TEMPLATE}
+${reportTemplateFor(taskId)}
 
 If your result is larger than ~6KB even after fitting the template, write the detail to a file under /tmp/${workerName}-*.{md,json} and put the path in NOTES with a one-line summary in SOLUTION.
 
@@ -269,6 +283,45 @@ const TOOLS = [
     },
   },
   {
+    name: "bus_tasks",
+    description:
+      "List tasks YOU spawned via bus_spawn_worker. Each task tracks " +
+      "the worker name, brief summary, spawn time, status (spawned | " +
+      "reported), and the message id of the worker's first result if " +
+      "received. Useful for: (a) seeing what's outstanding mid-fan-out, " +
+      "(b) recovering state after context compaction (your task " +
+      "registry survives even if your conversation memory is trimmed), " +
+      "(c) detecting stuck workers (status: spawned for hours = chip " +
+      "never clicked or worker errored).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["spawned", "reported", "all"],
+          default: "all",
+          description: "Filter by task status. Default 'all'.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bus_task",
+    description:
+      "Fetch full details for one task by id. Includes the brief " +
+      "summary, recipients, status, and (if reported) the result " +
+      "message id so you can locate the report in your inbox.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "string", description: "Task id (tsk-...)" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "bus_peers",
     description:
       "List every session known to the bus, with liveness and unread " +
@@ -282,7 +335,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.4.0" },
+  { name: "claude-bus", version: "0.5.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -352,12 +405,23 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
       }
 
+      // Record the task BEFORE generating the brief so we can embed the
+      // task id into the report template the worker will use.
+      const task = await createTask({
+        owner: SELF,
+        worker_name: workerName,
+        brief_summary: userBrief,
+        long_running: longRunning,
+        report_to: reportTo,
+      });
+
       const prompt = buildWorkerBrief({
         workerName,
         orchestratorName: SELF,
         userBrief,
         longRunning,
         reportTo,
+        taskId: task.id,
       });
 
       const ccLine = reportTo.length > 1
@@ -377,6 +441,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             text: JSON.stringify(
               {
                 ok: true,
+                task_id: task.id,
                 worker_name: workerName,
                 long_running: longRunning,
                 report_to: reportTo,
@@ -384,7 +449,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
                 next_step:
                   "Call spawn_task with the title, tldr, and prompt above. " +
                   "The user will see a chip and click to start the worker. " +
-                  `When the worker reports back, the message will appear in ${reportTo.length === 1 ? `your inbox ("${reportTo[0]}")` : `the inboxes of: ${reportTo.join(", ")}`} automatically. The report body uses a strict template (REPORT FROM / CONTEXT / WHY / PROBLEM / SOLUTION / STATUS / NOTES / NEXT STEPS) — surface it to the user as-is unless it drifted off-format.`,
+                  `When the worker reports back, the result will appear in ${reportTo.length === 1 ? `your inbox ("${reportTo[0]}")` : `the inboxes of: ${reportTo.join(", ")}`} automatically and task ${task.id} will be marked reported. ` +
+                  "Use bus_tasks() at any time to see what's outstanding (helpful after compaction).",
               },
               null,
               2
@@ -423,6 +489,50 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             text: JSON.stringify({ self: SELF, messages }, null, 2),
           },
         ],
+      };
+    }
+    if (name === "bus_tasks") {
+      const status = args.status || "all";
+      const tasks = await listTasks({ owner: SELF, status });
+      const summary = {
+        spawned: tasks.filter((t) => t.status === "spawned").length,
+        reported: tasks.filter((t) => t.status === "reported").length,
+      };
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { self: SELF, filter: status, summary, tasks },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    if (name === "bus_task") {
+      const t = await getTask(args.id);
+      if (!t) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `task not found: ${args.id}` }],
+        };
+      }
+      // Don't leak other orchestrators' tasks — but be explicit about why.
+      if (t.owner !== SELF) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `task ${t.id} is owned by "${t.owner}", not "${SELF}". You can only inspect tasks you spawned.`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify(t, null, 2) }],
       };
     }
     if (name === "bus_peers") {

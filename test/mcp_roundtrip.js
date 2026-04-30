@@ -63,7 +63,11 @@ const assert = (cond, msg) => {
 // 1. List tools.
 const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
-assert(JSON.stringify(names) === JSON.stringify(["bus_claim","bus_inbox","bus_peers","bus_send","bus_spawn_worker"]),
+const expectedTools = [
+  "bus_claim", "bus_inbox", "bus_peers", "bus_send",
+  "bus_spawn_worker", "bus_task", "bus_tasks",
+];
+assert(JSON.stringify(names) === JSON.stringify(expectedTools),
   `tools listed: ${names.join(",")}`);
 
 // 2. Auditor sends a brief to tester-1.
@@ -198,6 +202,79 @@ const swBadCC = await auditor.call("tools/call", {
   },
 });
 assert(swBadCC.result.isError === true, "invalid report_to entry rejected");
+
+// 10. bus_spawn_worker creates a task entry; its id is embedded in the brief.
+const taskId = swPayload.task_id;
+assert(/^tsk-[a-z0-9-]+$/.test(taskId), `task_id has expected format: ${taskId}`);
+assert(swPayload.spawn_task_args.prompt.includes(`TASK ID: ${taskId}`),
+  "task id is embedded in the report template inside the brief");
+
+// 11. bus_tasks lists the new task with status: spawned.
+const tlistRes = await auditor.call("tools/call", {
+  name: "bus_tasks", arguments: {},
+});
+const tlist = JSON.parse(tlistRes.result.content[0].text);
+const myTask = tlist.tasks.find((t) => t.id === taskId);
+assert(myTask !== undefined, "spawned task appears in bus_tasks");
+assert(myTask.status === "spawned", "task starts in 'spawned' status");
+assert(myTask.worker_name === "impact-analyzer", "worker_name on task");
+assert(tlist.summary.spawned >= 1, "summary counts spawned tasks");
+
+// 12. Filtering by status works.
+const reportedFilter = await auditor.call("tools/call", {
+  name: "bus_tasks", arguments: { status: "reported" },
+});
+const reported = JSON.parse(reportedFilter.result.content[0].text);
+assert(reported.tasks.find((t) => t.id === taskId) === undefined,
+  "task not returned when filtering for status=reported");
+
+// 13. Worker bus_sends a result with TASK ID line; task auto-flips to reported.
+//    We send from the "impact-analyzer" identity by claiming it on the
+//    second test session.
+await tester.call("tools/call", {
+  name: "bus_claim", arguments: { name: "impact-analyzer" },
+});
+const resultBody = `REPORT FROM: impact-analyzer
+TASK ID: ${taskId}
+CONTEXT: Spearman analysis
+WHY: Verify impact_score correlates with views
+PROBLEM: Suspected null correlation
+SOLUTION: Computed Spearman, found r=-0.07
+STATUS: done
+NOTES: n/a
+NEXT STEPS:
+- Replace impact_score model
+`;
+await tester.call("tools/call", {
+  name: "bus_send",
+  arguments: { to: "auditor", kind: "result", body: resultBody },
+});
+
+// Allow filesystem write to flush. (Same process so this is paranoia.)
+await new Promise((r) => setTimeout(r, 50));
+
+const after = await auditor.call("tools/call", {
+  name: "bus_task", arguments: { id: taskId },
+});
+const afterTask = JSON.parse(after.result.content[0].text);
+assert(afterTask.status === "reported",
+  `task auto-marked reported via bus_send body: actual status=${afterTask.status}`);
+assert(typeof afterTask.first_result_id === "string" &&
+       afterTask.first_result_id.length > 0,
+  "first_result_id populated on auto-mark");
+
+// 14. bus_task scoping: another session can't read auditor's task.
+const stranger = startSession("stranger");
+await stranger.init();
+await stranger.call("tools/call", {
+  name: "bus_claim", arguments: { name: "stranger" },
+});
+const stealAttempt = await stranger.call("tools/call", {
+  name: "bus_task", arguments: { id: taskId },
+});
+assert(stealAttempt.result.isError === true,
+  "non-owner cannot inspect another orchestrator's task");
+stranger.proc.kill();
 
 // 10. bus_claim response includes the protocol primer.
 const claim2 = await tester.call("tools/call", {

@@ -28,8 +28,9 @@ const ROOT = path.join(os.homedir(), ".claude-bus");
 const INBOX_DIR = path.join(ROOT, "inbox");
 const CURSOR_DIR = path.join(ROOT, "cursor");
 const ACTIVE_DIR = path.join(ROOT, "active");
+const TASKS_DIR = path.join(ROOT, "tasks");
 
-for (const dir of [ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR]) {
+for (const dir of [ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR]) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
@@ -89,6 +90,14 @@ export async function appendMessage({ from, to, kind, reply_to, body }) {
 
   const line = JSON.stringify(msg) + "\n";
   await fs.appendFile(inboxPath(to), line, "utf8");
+
+  // If this is a result, link it to its task so the spawning orchestrator
+  // can see status without re-deriving from inbox grep. Best-effort —
+  // failures here never break the send.
+  if (kind === "result") {
+    await maybeMarkTaskFromBody(body, msg.id);
+  }
+
   return msg;
 }
 
@@ -303,7 +312,132 @@ export function pruneStaleActive() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Task registry. One JSON file per task at tasks/<task-id>.json.
+// ---------------------------------------------------------------------------
+// A task is created when an orchestrator calls bus_spawn_worker. The task
+// id is embedded into the worker's brief and into the worker's eventual
+// `kind: "result"` body (via the REPORT TEMPLATE's "TASK ID:" line). When
+// a result message is sent, appendMessage parses the body and marks the
+// corresponding task as reported. Stale tasks (worker never replied)
+// remain visible to the orchestrator with status: "spawned".
+//
+// Tasks are owner-scoped by convention but world-readable on disk —
+// listTasks filters by owner. We don't bother with per-owner directories
+// because task ids are globally unique and there are not many of them.
+
+function taskPath(id) {
+  return path.join(TASKS_DIR, `${id}.json`);
+}
+
+export function newTaskId() {
+  const ts = Date.now().toString(36);
+  const rand = crypto.randomBytes(2).toString("hex");
+  return `tsk-${ts}-${rand}`;
+}
+
+export async function createTask({
+  owner,
+  worker_name,
+  brief_summary,
+  long_running,
+  report_to,
+}) {
+  assertName(owner, "owner");
+  assertName(worker_name, "worker_name");
+  if (typeof brief_summary !== "string") {
+    throw new Error("brief_summary must be a string");
+  }
+  if (!Array.isArray(report_to) || report_to.length === 0) {
+    throw new Error("report_to must be a non-empty array");
+  }
+  const id = newTaskId();
+  const task = {
+    id,
+    owner,
+    worker_name,
+    brief_summary: brief_summary.slice(0, 500),
+    long_running: !!long_running,
+    report_to,
+    status: "spawned",
+    spawned_at: new Date().toISOString(),
+    first_result_at: null,
+    first_result_id: null,
+  };
+  await fs.writeFile(taskPath(id), JSON.stringify(task, null, 2), "utf8");
+  return task;
+}
+
+export async function getTask(id) {
+  if (typeof id !== "string" || !/^tsk-[a-z0-9-]+$/.test(id)) {
+    throw new Error(`invalid task id: ${id}`);
+  }
+  try {
+    const raw = await fs.readFile(taskPath(id), "utf8");
+    return JSON.parse(raw);
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+// Mark a task as reported. Idempotent — only the first call sets
+// first_result_at/first_result_id. Returns the updated task or null if
+// the task does not exist.
+export async function markTaskReported(id, result_message_id) {
+  const task = await getTask(id);
+  if (!task) return null;
+  if (task.status === "reported") return task; // already done
+  task.status = "reported";
+  task.first_result_at = new Date().toISOString();
+  task.first_result_id = result_message_id;
+  await fs.writeFile(taskPath(id), JSON.stringify(task, null, 2), "utf8");
+  return task;
+}
+
+export async function listTasks({ owner, status } = {}) {
+  let entries;
+  try {
+    entries = await fs.readdir(TASKS_DIR);
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+  const tasks = [];
+  for (const f of entries) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const raw = await fs.readFile(path.join(TASKS_DIR, f), "utf8");
+      const t = JSON.parse(raw);
+      if (owner && t.owner !== owner) continue;
+      if (status && status !== "all" && t.status !== status) continue;
+      tasks.push(t);
+    } catch {
+      // skip corrupt task file
+    }
+  }
+  // Newest first.
+  tasks.sort((a, b) => b.spawned_at.localeCompare(a.spawned_at));
+  return tasks;
+}
+
+// Parse a message body for "TASK ID: tsk-..." and mark the corresponding
+// task as reported. Called from appendMessage on result-kind messages.
+// Errors are swallowed — task tracking is a side observation, not the
+// primary purpose of bus_send, and we never want to fail a send because
+// a task file went weird.
+export async function maybeMarkTaskFromBody(body, result_message_id) {
+  try {
+    if (typeof body !== "string") return;
+    const m = body.match(/^TASK ID:\s*(tsk-[a-z0-9-]+)\s*$/m);
+    if (!m) return;
+    await markTaskReported(m[1], result_message_id);
+  } catch {
+    // swallow
+  }
+}
+
 export const _paths = {
-  ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR,
-  inboxPath, cursorPath, activePath,
+  ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR,
+  inboxPath, cursorPath, activePath, taskPath,
 };
