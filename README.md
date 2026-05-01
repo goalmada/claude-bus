@@ -121,6 +121,21 @@ Registers this session's identity. The response includes a short protocol
 primer so a freshly-started orchestrator/worker can use the bus correctly
 without coaching.
 
+### `bus_scratch({ name?, purpose? })`
+Spawns a fresh idle worker session in **bypass-permissions mode**.
+Returns `spawn_task` arguments — call `spawn_task` with them and a chip
+appears for the user to click. The worker claims its name, acks once,
+then sits idle until the user types in its chat tab or the orchestrator
+`bus_send`s it a task.
+
+Useful as a workaround for Desktop builds where the new-session UI does
+not expose bypass mode (`anthropics/claude-code#55095`): the chip-spawn
+code path lands sessions in bypass mode reliably, so spawning a
+no-op worker is currently the only way to land an interactive bypass
+session through the Desktop UI. All args are optional; the default
+worker name is `scratch-<base36-timestamp>` so consecutive calls don't
+collide.
+
 ### `bus_spawn_worker(name, brief, long_running?, report_to?)`
 Generates a self-contained brief for a new worker and returns
 `spawn_task` arguments ready to invoke. The orchestrator passes plain

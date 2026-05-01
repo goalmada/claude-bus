@@ -390,10 +390,44 @@ const TOOLS = [
       "right now (useful for spotting stuck workers).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
+  {
+    name: "bus_scratch",
+    description:
+      "Spawn a fresh idle worker session in bypass-permissions mode. " +
+      "Returns spawn_task arguments — call spawn_task with them and a " +
+      "chip appears for the user to click. The worker claims its name, " +
+      "acks once, then sits idle until the user types in its chat or " +
+      "the orchestrator bus_sends it a task. Use this when you (or the " +
+      "user) just want a working Claude Code session with full " +
+      "permissions — typically as a workaround for Desktop builds " +
+      "where the new-session UI does not expose bypass mode " +
+      "(anthropics/claude-code#55095). All args are optional.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Optional bus name for the scratch worker. 1-64 chars, " +
+            "[a-zA-Z0-9_-] only. Defaults to 'scratch-<timestamp>' so " +
+            "consecutive calls don't collide.",
+        },
+        purpose: {
+          type: "string",
+          description:
+            "Optional one-line note baked into the worker's brief " +
+            "explaining why you wanted this scratch session. The " +
+            "worker reads it on launch but does not need to act on " +
+            "it — the worker stays idle until directly tasked.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.6.0" },
+  { name: "claude-bus", version: "0.7.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -693,6 +727,98 @@ a memory restore.`;
             type: "text",
             text: JSON.stringify(
               { self: SELF, unread: mine, peers },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    if (name === "bus_scratch") {
+      // Thin wrapper over bus_spawn_worker that produces an idle scratch
+      // worker. Useful as a workaround for Desktop builds where the
+      // new-session UI does not expose bypass mode (#55095): the
+      // chip-spawn path hardcodes bypass mode, so spawning a worker is
+      // currently the only way to land an interactive bypass session.
+      const workerName =
+        typeof args.name === "string" && args.name.length > 0
+          ? args.name
+          : `scratch-${Date.now().toString(36)}`;
+      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(workerName)) {
+        throw new Error(
+          `invalid worker name "${workerName}": must be 1-64 chars, [a-zA-Z0-9_-] only`
+        );
+      }
+      const purposeLine =
+        typeof args.purpose === "string" && args.purpose.trim().length > 0
+          ? `\n\nWhy ${SELF} spawned you: ${args.purpose.trim()}`
+          : "";
+      const userBrief =
+        `You are an idle scratch worker. ${SELF} (your orchestrator) does not have a specific task for you yet — you exist to be an interactive Claude Code session in bypass-permissions mode that the user can drive ad hoc.` +
+        purposeLine +
+        `\n\nProcedure:\n` +
+        `1. After bus_claim, send a single bus_send to ${SELF} with kind: "ack" and body "${workerName} alive and idle in bypass mode. Send tasks via bus_send or just type in the chat." so the orchestrator knows you are up.\n` +
+        `2. Then idle. Do NOT read any files, run any commands, or take any other action on launch.\n` +
+        `3. When the user types in your chat tab OR ${SELF} bus_sends you a task, treat that as your real assignment and work on it normally with full bypass-mode permissions.\n` +
+        `4. As a long-running worker, stay alive across multiple ad hoc tasks. Use bus_inbox between tasks if you have been idle for a while.\n` +
+        `5. Only send a structured report (REPORT FROM/TASK ID/...) when ${SELF} explicitly asks you to wrap up — most ad hoc work the user does in your chat won't need a report.\n\n` +
+        `There is no specific file or dataset for this worker — behave like a fresh assistant that happens to be in bypass mode.`;
+      // Reuse the same machinery as bus_spawn_worker to keep behavior
+      // identical (task registry, report template, brief shape). We
+      // carry forward long_running: true and report_to: [SELF].
+      const longRunning = true;
+      const reportTo = [SELF];
+      const title = `Open ${workerName} (bypass-mode scratch session)`;
+      if (title.length > 60) {
+        // The default name is short, but a user-supplied name could
+        // push us over. Fall back to the bare worker name in that case.
+        // (Title cap is a hard constraint of bus_spawn_worker.)
+        // Recompute a shorter title.
+        // (Won't trigger for default names — `scratch-<timestamp-base36>`
+        // is well under the cap.)
+      }
+      const safeTitle =
+        title.length > 60 ? `Open ${workerName} (scratch)` : title;
+      const task = await createTask({
+        owner: SELF,
+        worker_name: workerName,
+        brief_summary: userBrief,
+        long_running: longRunning,
+        report_to: reportTo,
+      });
+      const prompt = buildWorkerBrief({
+        workerName,
+        orchestratorName: SELF,
+        userBrief,
+        longRunning,
+        reportTo,
+        taskId: task.id,
+      });
+      const tldr =
+        `Spawns idle "${workerName}" worker in bypass mode. Stays open ` +
+        `for ad hoc tasks from ${SELF} or the user.`;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: true,
+                task_id: task.id,
+                worker_name: workerName,
+                long_running: longRunning,
+                report_to: reportTo,
+                spawn_task_args: {
+                  title: safeTitle,
+                  tldr,
+                  prompt,
+                },
+                next_step:
+                  "Call spawn_task with the title, tldr, and prompt above. " +
+                  "The user will see a chip and click to start the worker. " +
+                  "Once the worker acks back you can either bus_send it " +
+                  "tasks or tell the user to type directly in its chat tab.",
+              },
               null,
               2
             ),

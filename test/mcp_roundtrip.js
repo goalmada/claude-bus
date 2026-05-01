@@ -65,7 +65,7 @@ const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
 const expectedTools = [
   "bus_claim", "bus_inbox", "bus_peers", "bus_revive",
-  "bus_send", "bus_spawn_worker", "bus_task", "bus_tasks",
+  "bus_scratch", "bus_send", "bus_spawn_worker", "bus_task", "bus_tasks",
 ];
 assert(JSON.stringify(names) === JSON.stringify(expectedTools),
   `tools listed: ${names.join(",")}`);
@@ -391,6 +391,51 @@ const reviveBad = await auditor.call("tools/call", {
   name: "bus_revive", arguments: { name: "../evil" },
 });
 assert(reviveBad.result.isError === true, "invalid revive name rejected");
+
+// 21. v0.7: bus_scratch returns spawn_task_args for an idle bypass-mode
+// worker with zero required input.
+const scratch = await auditor.call("tools/call", {
+  name: "bus_scratch", arguments: {},
+});
+const scratchPayload = JSON.parse(scratch.result.content[0].text);
+assert(scratchPayload.ok === true, "bus_scratch ok");
+assert(scratchPayload.long_running === true,
+  "bus_scratch worker is long-running by default");
+assert(scratchPayload.worker_name.startsWith("scratch-"),
+  `default worker name uses scratch- prefix: ${scratchPayload.worker_name}`);
+assert(typeof scratchPayload.spawn_task_args.title === "string" &&
+       scratchPayload.spawn_task_args.title.length > 0 &&
+       scratchPayload.spawn_task_args.title.length <= 60,
+  "bus_scratch chip title within length cap");
+assert(scratchPayload.spawn_task_args.prompt.includes(
+  `bus_claim({name: "${scratchPayload.worker_name}"})`),
+  "scratch brief tells worker to claim its name");
+assert(scratchPayload.spawn_task_args.prompt.includes("bypass mode"),
+  "scratch brief mentions bypass mode");
+assert(scratchPayload.spawn_task_args.prompt.includes("idle"),
+  "scratch brief tells worker to idle until tasked");
+
+// 22. v0.7: bus_scratch accepts an optional purpose that gets baked into
+// the brief.
+const scratchPurpose = await auditor.call("tools/call", {
+  name: "bus_scratch", arguments: {
+    name: "scratch-with-reason",
+    purpose: "Walking the user through a tricky migration",
+  },
+});
+const scratchPurposePayload = JSON.parse(scratchPurpose.result.content[0].text);
+assert(scratchPurposePayload.worker_name === "scratch-with-reason",
+  "bus_scratch honors explicit name");
+assert(scratchPurposePayload.spawn_task_args.prompt.includes(
+  "Walking the user through a tricky migration"),
+  "purpose text is embedded in the worker brief");
+
+// 23. v0.7: bus_scratch rejects invalid worker names just like bus_spawn_worker.
+const scratchBad = await auditor.call("tools/call", {
+  name: "bus_scratch", arguments: { name: "../evil" },
+});
+assert(scratchBad.result.isError === true,
+  "invalid scratch worker name rejected");
 
 // 10. bus_claim response includes the protocol primer.
 const claim2 = await tester.call("tools/call", {
