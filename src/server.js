@@ -140,6 +140,16 @@ function reportTemplateFor(taskId) {
   return REPORT_TEMPLATE_TEMPLATE.replace("<TASK_ID_PLACEHOLDER>", taskId);
 }
 
+// Generate a short, scannable chip title from a bus name. Bus names are
+// kebab-case for protocol cleanliness ("dynamic-tier-classifier") but
+// the spawn_task chip in the UI shows up next to several others, so we
+// strip the dashes and prefix with a one-letter operation marker so the
+// user sees "s: dynamic tier classifier" instead of
+// "Spawn dynamic-tier-classifier worker".
+function chipTitle(prefix, name) {
+  return `${prefix} ${name.replace(/[-_]+/g, " ")}`;
+}
+
 // Self-contained brief generator for bus_spawn_worker. The worker session
 // has no memory of the orchestrator, so the brief teaches it the bus
 // protocol from cold.
@@ -427,7 +437,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.7.0" },
+  { name: "claude-bus", version: "0.8.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -488,7 +498,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Default flipped to true in v0.6: workers stay alive unless the
       // caller explicitly opts out.
       const longRunning = args.long_running === false ? false : true;
-      const title = args.title || `Spawn ${workerName} worker`;
+      const title = args.title || chipTitle("s:", workerName);
       const reportTo = Array.isArray(args.report_to) && args.report_to.length > 0
         ? args.report_to
         : [SELF];
@@ -660,7 +670,7 @@ a memory restore.`;
                 target_name: targetName,
                 target_was_alive: stillAlive,
                 spawn_task_args: {
-                  title: `Revive ${targetName}`,
+                  title: chipTitle("r:", targetName),
                   tldr,
                   prompt,
                 },
@@ -768,17 +778,9 @@ a memory restore.`;
       // carry forward long_running: true and report_to: [SELF].
       const longRunning = true;
       const reportTo = [SELF];
-      const title = `Open ${workerName} (bypass-mode scratch session)`;
-      if (title.length > 60) {
-        // The default name is short, but a user-supplied name could
-        // push us over. Fall back to the bare worker name in that case.
-        // (Title cap is a hard constraint of bus_spawn_worker.)
-        // Recompute a shorter title.
-        // (Won't trigger for default names — `scratch-<timestamp-base36>`
-        // is well under the cap.)
-      }
-      const safeTitle =
-        title.length > 60 ? `Open ${workerName} (scratch)` : title;
+      // Same "s: <name>" convention as bus_spawn_worker so the chips
+      // line up consistently in the user's UI.
+      const safeTitle = chipTitle("s:", workerName);
       const task = await createTask({
         owner: SELF,
         worker_name: workerName,

@@ -134,7 +134,8 @@ const sw = await auditor.call("tools/call", {
 const swPayload = JSON.parse(sw.result.content[0].text);
 assert(swPayload.ok === true, "bus_spawn_worker ok");
 assert(swPayload.worker_name === "impact-analyzer", "worker_name preserved");
-assert(swPayload.spawn_task_args.title.includes("impact-analyzer"), "title generated");
+assert(swPayload.spawn_task_args.title === "s: impact analyzer",
+  `title is short and dash-stripped: actual=${swPayload.spawn_task_args.title}`);
 assert(swPayload.spawn_task_args.prompt.includes('bus_claim({name: "impact-analyzer"})'),
   "brief instructs worker to claim its name");
 assert(swPayload.spawn_task_args.prompt.includes('to: "auditor"'),
@@ -363,8 +364,8 @@ assert(revivePayload.spawn_task_args.prompt.includes('bus_claim({name: "ghost-wo
   "revive brief tells new session to re-claim same name");
 assert(revivePayload.spawn_task_args.prompt.includes("bus_inbox({peek: true})"),
   "revive brief tells new session to peek inbox history");
-assert(revivePayload.spawn_task_args.title === "Revive ghost-worker",
-  "chip title reflects the operation");
+assert(revivePayload.spawn_task_args.title === "r: ghost worker",
+  `chip title is short and prefixed with r:: actual=${revivePayload.spawn_task_args.title}`);
 
 // 19. v0.6: bus_revive with follow_up embeds it in the brief.
 const reviveWithFollow = await auditor.call("tools/call", {

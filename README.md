@@ -88,6 +88,24 @@ each turn ends, an `asyncRewake` background poller waits up to 30 min
 for new mail and wakes the model the instant it arrives — so a
 coordinator that's idle while workers run will reactivate on its own.
 
+A second `Stop` hook (`worker-report-guard.sh`) catches the worker-
+forgetfulness failure mode: if a session is identified as a worker
+and has any task in `claimed` status (claimed but never reported),
+the hook wakes the model with a one-time-per-task reminder to either
+`bus_send` the result now or send a `kind: "status"` update with
+progress. Dedup state lives in `~/.claude-bus/reminded/<task-id>.txt`.
+
+When result-kind messages with a `TASK ID:` line land in your inbox,
+the render hook prepends a `📋 result for task <id> — was: "<brief
+summary>" — spawned <time-ago>, worker: <name>` callout so the
+orchestrator can correlate replies with original dispatches without
+scrolling chat history.
+
+Chip titles are short and dash-stripped: `s: dynamic tier classifier`
+instead of `Spawn dynamic-tier-classifier worker`. The internal bus
+name keeps the kebab-case for protocol cleanliness; only the chip
+display is shortened.
+
 ### Setting a session's identity
 
 There are two ways to tell a session who it is:
