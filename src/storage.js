@@ -434,6 +434,72 @@ export async function markTasksClaimedFor(workerName) {
   return best;
 }
 
+// Archive a worker's bus state. Removes the inbox JSONL and the cursor
+// file, and flips matching tasks (worker_name == name) into status
+// "archived". Refuses if the name is currently held by a live process —
+// archiving over a live worker would silently sever its inbox.
+//
+// Returns { ok, removed: { inbox, cursor }, archived_tasks: [...] } on
+// success, or throws on alive-conflict.
+export async function archiveSession(name) {
+  assertName(name, "name");
+  if (await isPeerAlive(name)) {
+    const err = new Error(
+      `cannot archive "${name}": a Claude Code session is currently holding this name. Close the window first (or have the worker call bus_send to acknowledge it's done, then close), then archive.`
+    );
+    err.code = "ALIVE";
+    throw err;
+  }
+
+  const result = {
+    ok: true,
+    removed: { inbox: false, cursor: false },
+    archived_tasks: [],
+  };
+
+  // Remove inbox + cursor.
+  try {
+    await fs.unlink(inboxPath(name));
+    result.removed.inbox = true;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  try {
+    await fs.unlink(cursorPath(name));
+    result.removed.cursor = true;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  // Flip matching tasks. Only the orchestrator who spawned a task
+  // would normally archive its workers, but we don't enforce ownership
+  // here — the bus_archive handler does, and bypassing it is a deliberate
+  // operator choice. Mark all tasks whose worker_name == name.
+  let entries = [];
+  try {
+    entries = await fs.readdir(TASKS_DIR);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  for (const f of entries) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const raw = await fs.readFile(path.join(TASKS_DIR, f), "utf8");
+      const t = JSON.parse(raw);
+      if (t.worker_name !== name) continue;
+      if (t.status === "archived") continue;
+      t.status = "archived";
+      t.archived_at = new Date().toISOString();
+      await fs.writeFile(taskPath(t.id), JSON.stringify(t, null, 2), "utf8");
+      result.archived_tasks.push(t.id);
+    } catch {
+      // skip corrupt
+    }
+  }
+
+  return result;
+}
+
 // True if at least one Claude Code session is currently holding `name`
 // on the bus. Used by bus_send to surface dead-recipient warnings.
 export async function isPeerAlive(name) {

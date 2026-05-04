@@ -11,6 +11,10 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import fsSync from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { spawn as childSpawn } from "node:child_process";
 
 import {
   appendMessage,
@@ -26,6 +30,7 @@ import {
   listTasks,
   markTasksClaimedFor,
   isPeerAlive,
+  archiveSession,
   MAX_BODY_BYTES,
 } from "./storage.js";
 
@@ -117,7 +122,21 @@ const PROTOCOL_PRIMER = `You are now identified on claude-bus. Quick protocol:
 
 • Workers default to long_running: true so they stay alive after their
   first reply and remain reachable for follow-ups. Pass long_running:
-  false explicitly only for genuinely one-shot work.`;
+  false explicitly only for genuinely one-shot work.
+
+• Chip titles are prefixed by project. The bus reads CLAUDE_BUS_PROJECT_
+  PREFIX env or .claude-bus/config.json walked up from cwd to pick a
+  short marker (e.g. "cb" for cryptobriefing, "r" for rumbo). Spawn
+  chips read "cb: <name>"; revive chips read "cb: ↻ <name>". You can
+  also pass project_prefix explicitly to bus_spawn_worker / bus_revive /
+  bus_scratch for one-off control.
+
+• Once a worker is permanently done (one-shot reported, or you have
+  closed its window), call bus_archive(name) to clean its bus state —
+  inbox, cursor, and tasks marked archived. Refuses if the worker is
+  still alive; in that case either close the window first or
+  bus_send the worker an explicit "you can close" so it knows to exit
+  cleanly.`;
 
 // Strict report template every worker uses for its result body. Stamping
 // structure at message-creation time means the orchestrator surfaces
@@ -140,14 +159,80 @@ function reportTemplateFor(taskId) {
   return REPORT_TEMPLATE_TEMPLATE.replace("<TASK_ID_PLACEHOLDER>", taskId);
 }
 
-// Generate a short, scannable chip title from a bus name. Bus names are
-// kebab-case for protocol cleanliness ("dynamic-tier-classifier") but
-// the spawn_task chip in the UI shows up next to several others, so we
-// strip the dashes and prefix with a one-letter operation marker so the
-// user sees "s: dynamic tier classifier" instead of
-// "Spawn dynamic-tier-classifier worker".
-function chipTitle(prefix, name) {
-  return `${prefix} ${name.replace(/[-_]+/g, " ")}`;
+// Resolve the project prefix for chip titles. Resolution order:
+//   1. Explicit `project_prefix` arg on the tool call (caller override).
+//   2. CLAUDE_BUS_PROJECT_PREFIX env var.
+//   3. .claude-bus/config.json walking up from cwd (similar to .git).
+//   4. null (no project — fall back to the operation marker s: / r:).
+//
+// Project prefix is 1-8 chars, [a-z0-9-]. Validated at every use site.
+function readProjectPrefixFromConfig() {
+  let dir = process.cwd();
+  // Defensive cap on traversal depth (filesystem cycles shouldn't
+  // happen but better safe than infinite-loop).
+  for (let i = 0; i < 64; i++) {
+    const candidate = path.join(dir, ".claude-bus", "config.json");
+    try {
+      if (fsSync.existsSync(candidate)) {
+        const raw = fsSync.readFileSync(candidate, "utf8");
+        const cfg = JSON.parse(raw);
+        if (typeof cfg.prefix === "string" && cfg.prefix.length > 0) {
+          return cfg.prefix;
+        }
+      }
+    } catch {
+      // ignore unreadable / malformed config and keep walking
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function isValidProjectPrefix(p) {
+  return typeof p === "string" && /^[a-z0-9][a-z0-9-]{0,7}$/.test(p);
+}
+
+function resolveProjectPrefix(explicit) {
+  if (explicit !== undefined && explicit !== null && explicit !== "") {
+    if (!isValidProjectPrefix(explicit)) {
+      throw new Error(
+        `invalid project_prefix "${explicit}": must be 1-8 chars, [a-z0-9-]`
+      );
+    }
+    return explicit;
+  }
+  const fromEnv = process.env.CLAUDE_BUS_PROJECT_PREFIX;
+  if (fromEnv && isValidProjectPrefix(fromEnv)) return fromEnv;
+  const fromFile = readProjectPrefixFromConfig();
+  if (fromFile && isValidProjectPrefix(fromFile)) return fromFile;
+  return null;
+}
+
+// Build a short, scannable chip title from a bus name and the operation
+// being performed. Bus names are kebab-case for protocol cleanliness
+// ("dynamic-tier-classifier") but the spawn_task chip in the UI shows
+// up next to several others, so we strip the dashes and prefix with a
+// project marker (if configured) or a one-letter operation marker.
+//
+// Examples:
+//   no project, spawn:    "s: dynamic tier classifier"
+//   no project, revive:   "r: ghost"
+//   project=cb, spawn:    "cb: dynamic tier classifier"
+//   project=cb, revive:   "cb: ↻ ghost"
+//   project=r,  spawn:    "r: market scraper"
+//   project=r,  revive:   "r: ↻ market scraper"
+function chipTitle({ name, operation = "spawn", projectPrefix = null }) {
+  const shortName = name.replace(/[-_]+/g, " ");
+  if (projectPrefix) {
+    const opMarker = operation === "revive" ? "↻ " : "";
+    return `${projectPrefix}: ${opMarker}${shortName}`;
+  }
+  // No project configured — keep the v0.8 behavior: s: for spawn-like
+  // operations, r: for revive.
+  const fallback = operation === "revive" ? "r:" : "s:";
+  return `${fallback} ${shortName}`;
 }
 
 // Self-contained brief generator for bus_spawn_worker. The worker session
@@ -184,6 +269,42 @@ If your result is larger than ~6KB even after fitting the template, write the de
 If you have a blocking question, send kind: "question" to ${orchestratorName} with your question (free-form body — the template only applies to "result" kind). Their reply will arrive automatically (push hook wakes you).
 
 Important: do not assume anything not stated above. The orchestrator has no memory of you and you have no memory of them — the bus is your only channel.`;
+}
+
+// User-wide notification toggle. Either set CLAUDE_BUS_NOTIFY in the
+// shell environment, or `touch ~/.claude-bus/notify.on`. We read both
+// because env vars don't always propagate from Claude Code into MCP
+// subprocesses on every host configuration.
+function notificationsEnabled() {
+  if (process.env.CLAUDE_BUS_NOTIFY) return true;
+  try {
+    return fsSync.existsSync(path.join(os.homedir(), ".claude-bus", "notify.on"));
+  } catch {
+    return false;
+  }
+}
+
+// Fire a passive macOS notification. Best-effort: never throws, never
+// blocks. Off-platform is a silent no-op. detached+unref so the process
+// doesn't stick around if Claude Code reaps the MCP server.
+function fireNotification(title, message, sound = "Glass") {
+  if (!notificationsEnabled()) return;
+  if (process.platform !== "darwin") return;
+  try {
+    const safeMessage = String(message).replace(/"/g, '\\"');
+    const safeTitle = String(title).replace(/"/g, '\\"');
+    const child = childSpawn(
+      "osascript",
+      [
+        "-e",
+        `display notification "${safeMessage}" with title "${safeTitle}" sound name "${sound}"`,
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    child.unref();
+  } catch {
+    // swallow
+  }
 }
 
 // Best-effort cleanup of stale entries from ended sessions.
@@ -313,6 +434,18 @@ const TOOLS = [
             "another orchestrator, or a logger — e.g. " +
             "report_to: ['orchestrator', 'data-auditor'].",
         },
+        project_prefix: {
+          type: "string",
+          description:
+            "Optional project prefix for the chip title (1-8 chars, " +
+            "[a-z0-9-]). When set, the chip reads " +
+            "'cb: dynamic tier classifier' instead of 's: ...'. Useful " +
+            "when running fan-outs across multiple projects (e.g. 'cb' " +
+            "for cryptobriefing, 'r' for rumbo) so chips are scannable " +
+            "by project at a glance. If omitted, falls back to the " +
+            "CLAUDE_BUS_PROJECT_PREFIX env var, then to .claude-bus/" +
+            "config.json walked up from cwd, then to plain 's:'.",
+        },
       },
       additionalProperties: false,
     },
@@ -345,6 +478,13 @@ const TOOLS = [
             "Optional plain-English instruction to surface to the reborn " +
             "session in addition to whatever was queued. Use this when " +
             "you have new context the worker didn't have before dying.",
+        },
+        project_prefix: {
+          type: "string",
+          description:
+            "Optional project prefix for the chip title (same semantics " +
+            "as bus_spawn_worker.project_prefix). If omitted, resolves " +
+            "from CLAUDE_BUS_PROJECT_PREFIX env, then .claude-bus/config.json.",
         },
       },
       additionalProperties: false,
@@ -430,6 +570,38 @@ const TOOLS = [
             "worker reads it on launch but does not need to act on " +
             "it — the worker stays idle until directly tasked.",
         },
+        project_prefix: {
+          type: "string",
+          description:
+            "Optional project prefix for the chip title (same semantics " +
+            "as bus_spawn_worker.project_prefix).",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bus_archive",
+    description:
+      "Mark a worker's bus state as archived. Removes the worker's " +
+      "inbox file and read cursor, and flips any tasks where " +
+      "worker_name == this name into status: 'archived'. Refuses to " +
+      "archive a name that is currently held by a live Claude Code " +
+      "session — close the worker's window first, OR use bus_send to " +
+      "ask it to close, then archive. Archiving does NOT close the " +
+      "Claude Code window itself (we have no privileged path to do " +
+      "that from the bus layer); it cleans the bus state so the " +
+      "orchestrator's bus_peers/bus_tasks views don't accumulate dead " +
+      "weight. The window can be closed manually after archiving.",
+    inputSchema: {
+      type: "object",
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Worker bus name to archive. 1-64 chars, [a-zA-Z0-9_-].",
+        },
       },
       additionalProperties: false,
     },
@@ -437,7 +609,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.8.0" },
+  { name: "claude-bus", version: "0.9.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -498,7 +670,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Default flipped to true in v0.6: workers stay alive unless the
       // caller explicitly opts out.
       const longRunning = args.long_running === false ? false : true;
-      const title = args.title || chipTitle("s:", workerName);
+      const projectPrefix = resolveProjectPrefix(args.project_prefix);
+      const title =
+        args.title ||
+        chipTitle({ name: workerName, operation: "spawn", projectPrefix });
       const reportTo = Array.isArray(args.report_to) && args.report_to.length > 0
         ? args.report_to
         : [SELF];
@@ -605,6 +780,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           `differently-named worker — reusing the name preserves the ` +
           `conversation thread.`;
       }
+      // Fire user-facing notification when a result arrives. Only for
+      // result-kind sends, since those are the "this work is done"
+      // signal the user actually wants to be told about. Other kinds
+      // (status, question, brief) would be too chatty.
+      if (args.kind === "result") {
+        fireNotification(
+          "claude-bus",
+          `${SELF} → ${args.to}: result delivered. Switch to your ${args.to} window to see findings.`,
+          "Glass"
+        );
+      }
       return {
         content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
       };
@@ -670,7 +856,11 @@ a memory restore.`;
                 target_name: targetName,
                 target_was_alive: stillAlive,
                 spawn_task_args: {
-                  title: chipTitle("r:", targetName),
+                  title: chipTitle({
+                    name: targetName,
+                    operation: "revive",
+                    projectPrefix: resolveProjectPrefix(args.project_prefix),
+                  }),
                   tldr,
                   prompt,
                 },
@@ -728,6 +918,35 @@ a memory restore.`;
         content: [{ type: "text", text: JSON.stringify(t, null, 2) }],
       };
     }
+    if (name === "bus_archive") {
+      try {
+        const result = await archiveSession(args.name);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ok: true,
+                  archived: args.name,
+                  removed: result.removed,
+                  archived_tasks: result.archived_tasks,
+                  note:
+                    "The bus state is clean. The Claude Code window holding this name (if any was open) is unaffected — close it manually when convenient.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `claude-bus error: ${err.message}` }],
+        };
+      }
+    }
     if (name === "bus_peers") {
       const peers = await listPeerInfo();
       const mine = await unreadCount(SELF);
@@ -780,7 +999,11 @@ a memory restore.`;
       const reportTo = [SELF];
       // Same "s: <name>" convention as bus_spawn_worker so the chips
       // line up consistently in the user's UI.
-      const safeTitle = chipTitle("s:", workerName);
+      const safeTitle = chipTitle({
+        name: workerName,
+        operation: "spawn",
+        projectPrefix: resolveProjectPrefix(args.project_prefix),
+      });
       const task = await createTask({
         owner: SELF,
         worker_name: workerName,

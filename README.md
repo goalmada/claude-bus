@@ -106,6 +106,30 @@ instead of `Spawn dynamic-tier-classifier worker`. The internal bus
 name keeps the kebab-case for protocol cleanliness; only the chip
 display is shortened.
 
+When you're juggling multiple projects, configure a project prefix so
+chips from different projects are scannable at a glance:
+
+```json
+// .claude-bus/config.json (in project root, walked up from cwd)
+{ "prefix": "cb" }
+```
+
+With this in your cryptobriefing repo, every spawn chip from that
+project reads `cb: dynamic tier classifier`. Drop a `{"prefix": "r"}`
+in your rumbo repo and chips from there read `r: market scraper`.
+Revive operations get a small `↻` marker (`cb: ↻ ghost worker`) so
+recovery is visually distinct from fresh spawns. Override per-call
+with `bus_spawn_worker({project_prefix: "cb", ...})` or globally with
+`CLAUDE_BUS_PROJECT_PREFIX=cb`.
+
+To get a macOS notification (banner + sound) every time a worker
+sends a `kind: "result"` message, set `CLAUDE_BUS_NOTIFY=1` in your
+shell or `touch ~/.claude-bus/notify.on`. The Mac app limitation:
+all Claude Code sessions live inside a single window with internal
+tabs, so the notification can't include a "click to close that
+worker's window" action — it just nudges you to switch over and
+close manually.
+
 ### Setting a session's identity
 
 There are two ways to tell a session who it is:

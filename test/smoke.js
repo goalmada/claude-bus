@@ -156,6 +156,33 @@ const spawned = await listTasks({ owner: "auditor", status: "spawned" });
 assert(spawned.length === 1 && spawned[0].id === t3.id,
   "spawned filter returns the still-pending task");
 
+// 14. v0.9: archiveSession removes inbox + cursor + flips matching tasks.
+const { archiveSession } = await import("../src/storage.js");
+await appendMessage({
+  from: "auditor", to: "donezo", kind: "brief", body: "do the thing",
+});
+await readInbox("donezo"); // create cursor
+const tDone = await createTask({
+  owner: "auditor", worker_name: "donezo", brief_summary: "ok",
+  long_running: false, report_to: ["auditor"],
+});
+const arch = await archiveSession("donezo");
+assert(arch.removed.inbox === true, "archive removed inbox file");
+assert(arch.removed.cursor === true, "archive removed cursor file");
+assert(arch.archived_tasks.includes(tDone.id),
+  "matching task flipped to archived");
+const tDoneAfter = await getTask(tDone.id);
+assert(tDoneAfter.status === "archived",
+  "task status reads 'archived' after archive");
+assert(typeof tDoneAfter.archived_at === "string",
+  "archived_at timestamp recorded");
+
+// 15. archiveSession is idempotent on tasks (re-archiving an already-
+//     archived name doesn't re-stamp archived_at).
+const arch2 = await archiveSession("donezo");
+assert(arch2.archived_tasks.length === 0,
+  "second archive of same name finds no still-active tasks");
+
 await fs.rm(tmp, { recursive: true, force: true });
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

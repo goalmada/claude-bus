@@ -64,7 +64,7 @@ const assert = (cond, msg) => {
 const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
 const expectedTools = [
-  "bus_claim", "bus_inbox", "bus_peers", "bus_revive",
+  "bus_archive", "bus_claim", "bus_inbox", "bus_peers", "bus_revive",
   "bus_scratch", "bus_send", "bus_spawn_worker", "bus_task", "bus_tasks",
 ];
 assert(JSON.stringify(names) === JSON.stringify(expectedTools),
@@ -379,7 +379,63 @@ const followPayload = JSON.parse(reviveWithFollow.result.content[0].text);
 assert(followPayload.spawn_task_args.prompt.includes("build is also failing on macOS"),
   "follow_up embedded in revive brief");
 
-// 20. v0.6: invalid name on bus_revive is rejected.
+// 22. v0.9: project_prefix override produces "<prefix>: <name>" titles.
+const swCB = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "v2-ws-shipper",
+    brief: "Ship the v2 websocket adapter — at least ten chars.",
+    project_prefix: "cb",
+  },
+});
+const swCBPayload = JSON.parse(swCB.result.content[0].text);
+assert(swCBPayload.spawn_task_args.title === "cb: v2 ws shipper",
+  `project_prefix=cb produces 'cb: <name>': actual=${swCBPayload.spawn_task_args.title}`);
+
+// 23. v0.9: invalid project_prefix rejected.
+const swBadPrefix = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "x", brief: "ten chars min", project_prefix: "Bad Prefix With Spaces",
+  },
+});
+assert(swBadPrefix.result.isError === true, "invalid project_prefix rejected");
+
+// 24. v0.9: bus_revive with project_prefix produces "<prefix>: ↻ <name>".
+const reviveCB = await auditor.call("tools/call", {
+  name: "bus_revive",
+  arguments: { name: "ghost-worker-2", project_prefix: "cb" },
+});
+const reviveCBPayload = JSON.parse(reviveCB.result.content[0].text);
+assert(reviveCBPayload.spawn_task_args.title === "cb: ↻ ghost worker 2",
+  `revive with project=cb: actual=${reviveCBPayload.spawn_task_args.title}`);
+
+// 25. v0.9: bus_archive removes a dead worker's bus state.
+//     Use the orchestrator session to send TO a name nothing's claiming,
+//     then archive it. (We can't test live-rejection cleanly in the same
+//     process since both "sessions" share the test ppid.)
+await auditor.call("tools/call", {
+  name: "bus_send",
+  arguments: { to: "to-archive", kind: "brief", body: "you can be archived" },
+});
+const archive = await auditor.call("tools/call", {
+  name: "bus_archive", arguments: { name: "to-archive" },
+});
+const archivePayload = JSON.parse(archive.result.content[0].text);
+assert(archivePayload.ok === true, "bus_archive returns ok");
+assert(archivePayload.archived === "to-archive", "archived name preserved");
+assert(archivePayload.removed.inbox === true, "inbox file removed");
+
+// 26. v0.9: archived name is gone from peers.
+const peersAfterArchive = await auditor.call("tools/call", {
+  name: "bus_peers", arguments: {},
+});
+const peerNamesAfter = JSON.parse(peersAfterArchive.result.content[0].text)
+  .peers.map((p) => p.name);
+assert(!peerNamesAfter.includes("to-archive"),
+  `archived name no longer in peers list: ${peerNamesAfter.join(",")}`);
+
+// 27. v0.6: invalid name on bus_revive is rejected.
 //
 // (Note: a check for "revive on already-alive name flags target_was_alive"
 // would be ideal here, but in this test harness multiple "sessions" share
