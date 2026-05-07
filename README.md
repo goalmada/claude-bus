@@ -1,8 +1,17 @@
 # claude-bus
 
-A tiny MCP server that lets Claude Code sessions send each other messages
-through shared inboxes. Coordinator/worker agent patterns without a
-framework — just 150 lines of Node and a JSONL file per session.
+An MCP server that lets Claude Code sessions on the same machine send
+each other messages, spawn workers, track tasks, and recover from
+disconnects — without a framework, without a daemon, and without
+copy-paste through human eyes. Storage is append-only JSONL. Push is
+a shell hook that polls a file. The whole protocol can be inspected
+with `cat`.
+
+Started as ~150 lines for a coordinator/worker fan-out demo
+(see [CHANGELOG.md](./CHANGELOG.md) v0.1.0). Real-use friction drove
+it to v0.10 with a fully closed disconnect-detection class. See the
+[Diagnostic surface](#diagnostic-surface) section for what each
+detection mechanism catches.
 
 ## What problem it solves
 
@@ -324,6 +333,29 @@ claude-bus send auditor tester-1 brief "run suite A"
 4. The auditor synthesizes once all outstanding briefs have replies.
 
 See `examples/data-auditor.md` for a worked example.
+
+## Diagnostic surface
+
+The disconnect failure modes that came up in real use, and what
+v0.10 catches each with:
+
+| Failure mode | How you detect it |
+|---|---|
+| Worker reported but I missed the wake | Wake-on-unread fires on next `Stop` hook event (the cursor is behind file size, hook fires `exit 2`). v0.9. |
+| Worker forgot to `bus_send` | Worker-side `worker-report-guard.sh` Stop hook nudges the model once before idle. v0.8. Plus orchestrator-side check-in deadline (v0.10). |
+| Worker is alive but its asyncRewake hook isn't running | `bus_peers` reports `alive: true, responsive: false`. `bus_send` warning. v0.10. |
+| Message landed but recipient hasn't read it | `bus_delivery(to, offset)` returns `read: false`. Asyncrewake hook auto-fires nudge after 5 min unread, pointing at `bus_revive`. v0.10. |
+| Recipient is fully dead (process gone) | `bus_send` returns `recipient_alive: false` with warning pointing at `bus_revive`. v0.6. |
+| Recipient died, want to resume the thread | `bus_revive(name, follow_up?)` respawns a fresh session re-claiming the same name + reading prior inbox history as context. v0.6. |
+| Task is past ETA without a report | `check_in_minutes` on `bus_spawn_worker` (default 30); hook fires structured one-time nudge naming likely causes. v0.10. |
+| Long-idle orchestrator fell off the watch list | Default `CLAUDE_BUS_WAIT_SECONDS` = 7 days; on timeout, macOS notification self-diagnoses ("submit any prompt to re-arm"). v0.9 + v0.10. |
+| Result body too long for inline-render | Hook caps per-message at 8 KB and points at `bus_inbox(peek: true)` for full re-read. v0.4. |
+| Bus state cluttered with finished workers | `bus_archive(name)` removes inbox/cursor and flips matching tasks to `archived`. v0.9. |
+
+The dedup invariants (`nudged_at` on tasks, `_nudged` on outgoing
+records, `reminded/<task>.txt` for worker-side guard) ensure each
+detection fires at most once per case — the bus surfaces the signal,
+the orchestrator decides what to do.
 
 ## Design notes
 

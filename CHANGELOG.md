@@ -1,0 +1,219 @@
+# Changelog
+
+All notable changes to claude-bus. Format roughly follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [0.10.0] — 2026-05-07
+
+The "stuck worker detection" failure class is closed. Four tightly-coupled
+features piggyback on the existing asyncRewake Stop hook poll loop — no
+new daemons, no new MCP transport.
+
+### Added
+
+- **Read receipts.** `bus_send` response now includes `delivered_offset`
+  (byte offset where the message was appended). New `bus_delivery(to,
+  offset)` tool returns `{read, current_cursor}` by comparing the
+  recipient's cursor to the offset. The cursor *is* the read marker —
+  it advances when the recipient's UserPromptSubmit/Stop hook delivers
+  messages inline OR when `bus_inbox()` is called.
+- **Outgoing-message tracking.** Per-session log at
+  `~/.claude-bus/sent/<name>.jsonl`. The asyncRewake hook scans this on
+  every poll iteration; messages older than `CLAUDE_BUS_STUCK_SECONDS`
+  (default 300s) and still unread fire a one-time wake nudge pointing
+  at `bus_revive`.
+- **Heartbeat liveness.** `wait-for-mail.sh` touches
+  `~/.claude-bus/heartbeat/<name>.txt` every poll iteration.
+  `bus_peers` reports `responsive: bool` per peer (heartbeat fresh
+  within 120s) — distinct from `alive` (PID holds the name). When you
+  `bus_send` to an alive-but-non-responsive recipient, the response
+  surfaces a warning: positive evidence the hook is broken, separate
+  from the silent "alive but maybe broken" gap.
+- **Task check-in deadlines.** `bus_spawn_worker` accepts
+  `check_in_minutes` (default 30, 0 disables, max 7 days). Task records
+  gain `check_in_at` and `nudged_at` fields. When a task is past its
+  deadline without being reported, the hook fires a structured one-time
+  wake nudge naming the worker, brief, and likely causes ("missed the
+  wake" vs "still working/stuck").
+
+### Changed
+
+- Default `CLAUDE_BUS_WAIT_SECONDS` raised from `21600` (6 hours) to
+  `604800` (7 days). A sleeping bash poller has trivial resource cost,
+  and v0.9's timeout-notification self-diagnoses on expiry. Real-world
+  idle stretches now stay watched indefinitely.
+
+### Why lightweight (hook-touch) over invasive (worker pings) heartbeat
+
+The load-bearing signal for "can I reach this worker?" is whether the
+asyncRewake hook is running, not whether the model is. Hook-touch is
+free; 60s model-driven `bus_alive()` pings would cost continuous tokens
+for an edge case (wedged model + alive process) that hasn't been observed
+in practice.
+
+## [0.9.0] — 2026-05-04
+
+Critical bug fix plus three feature additions.
+
+### Fixed
+
+- **Silent deafness past 30-min idle.** The `Stop` asyncRewake hook
+  defaulted to a 30-minute poll cap, then exited cleanly. Messages
+  arriving after that into a long-idle orchestrator landed in a dead
+  poller — wake never fired. Default raised to 6 hours and the hook
+  now fires a macOS notification on timeout so silence is
+  self-diagnosing. (Further raised to 7 days in v0.10.)
+- **Wake-on-unread race.** The hook anchored on `start_size` at hook
+  start and only woke for *new* bytes. Mail arriving between
+  `UserPromptSubmit` and `Stop` within a turn — and not surfaced
+  during that turn — was silently ignored by the next Stop hook
+  (size unchanged since start, despite cursor < size). New logic:
+  wake whenever cursor is behind file size, regardless of when those
+  bytes arrived.
+
+### Added
+
+- **Project prefixes for chip titles.** `.claude-bus/config.json` in
+  the project root (walked up from cwd) sets a per-project prefix.
+  `cb: dynamic tier classifier` instead of `s: dynamic-tier-classifier`.
+  Revive operations get a `↻` marker (`cb: ↻ ghost worker`). Override
+  via `CLAUDE_BUS_PROJECT_PREFIX` env or per-call `project_prefix` arg.
+- **`bus_archive(name)`** tool. Removes inbox file, cursor, and flips
+  matching tasks to `status: "archived"`. Refuses if a live session
+  still holds the name.
+- **Optional macOS notifications.** Set `CLAUDE_BUS_NOTIFY=1` in shell
+  or `touch ~/.claude-bus/notify.on`. Result-kind `bus_send`s fire a
+  banner + sound. Mac app limit: all sessions live in one window with
+  internal tabs, so AppleScript can't reliably target individual tabs
+  for closing — the notification nudges you to switch and close
+  manually.
+
+## [0.8.0] — 2026-05-03
+
+UX polish driven by real-use friction.
+
+### Added
+
+- **Short chip titles.** `s: dynamic tier classifier` instead of
+  `Spawn dynamic-tier-classifier worker`. `bus_revive` uses `r:`. Bus
+  protocol names keep their kebab-case; only the chip display is
+  shortened.
+- **Task-linkage callout in inbox renders.** When a result-kind message
+  with a `TASK ID:` line lands, the system-reminder prepends a callout
+  line summarizing the originating task: `📋 result for task tsk-abc —
+  was: "<brief>" — spawned 23m ago, worker: <name>`. Closes the "the
+  orchestrator missed that this reply matched a task it dispatched"
+  failure mode without needing it to call `bus_task` by hand.
+- **Worker-side asyncRewake report-guard hook.** When a worker session
+  is about to stop AND has a claimed-but-unreported task, the hook
+  wakes the model with a one-time-per-task reminder to `bus_send` a
+  result or send `kind: "status"` with progress. Dedup state at
+  `~/.claude-bus/reminded/<task-id>.txt`.
+
+## [0.7.0] — 2026-05-01
+
+### Added
+
+- **`bus_scratch(name?, purpose?)`** tool. Spawns a fresh idle Claude
+  Code session in bypass-permissions mode. Workaround for Mac app
+  builds where the new-session UI doesn't expose bypass mode
+  (`anthropics/claude-code#55095`). Workers acks once, then idle until
+  the user types in their tab or the orchestrator `bus_send`s a task.
+
+## [0.6.0] — 2026-04-29
+
+Long-lived workers by default; dead-worker recovery primitive.
+
+### Changed
+
+- **`long_running` default flipped to `true`.** Workers stay alive
+  after their first reply and listen for follow-ups. The orchestrator
+  can `bus_send` additional tasks to the same name — same context,
+  same session, no new chip. Pass `long_running: false` explicitly
+  for genuinely one-shot work.
+
+### Added
+
+- **`bus_revive(name, follow_up?)`** tool. When a worker is dead but
+  the orchestrator wants to continue the conversation, `bus_revive`
+  generates a `spawn_task` brief that respawns a fresh session
+  re-claiming the *same name* and reading prior inbox history as
+  context. Preserves the conversation thread without proliferating
+  worker names.
+- **`recipient_alive` in `bus_send` response.** When false, the
+  response includes a warning pointing at `bus_revive`.
+- **`claimed` task lifecycle state.** `bus_claim` flips matching open
+  tasks from `spawned` to `claimed` automatically. Distinguishes
+  "chip not yet clicked" from "worker is alive and working."
+
+## [0.5.0] — 2026-04-29
+
+### Added
+
+- **Task registry.** `bus_spawn_worker` records each spawn at
+  `~/.claude-bus/tasks/<id>.json`. `TASK ID: <id>` line embedded in
+  the report template; when the worker `bus_send`s a result with a
+  matching `TASK ID:` line, the bus auto-flips the task from
+  `spawned` to `reported`.
+- **`bus_tasks(status?)`** tool — list tasks owned by this session.
+  Survives context compaction.
+- **`bus_task(id)`** tool — full detail for one task, owner-scoped.
+
+## [0.4.0] — 2026-04-29
+
+Strict report template + multi-recipient reports.
+
+### Added
+
+- **Report template baked into worker briefs.** 8-section structure
+  (REPORT FROM / TASK ID / CONTEXT / WHY / PROBLEM / SOLUTION /
+  STATUS / NOTES / NEXT STEPS). Real bake-off vs. "let the
+  orchestrator reformat" found template-at-source wins on cost
+  (2.2× cheaper), latency (1.6× faster), audit-trail quality, and
+  proactive next-steps quality.
+- **`report_to: ["a", "b"]`** parameter — CC the structured report
+  to additional sessions (e.g. an audit/log session). Default
+  `[<your-name>]`.
+
+### Fixed
+
+- `bus_inbox(peek: true)` returns full history regardless of cursor
+  (previously only returned messages past cursor, which broke
+  re-reading truncated bodies).
+- Hook body cap matched to `bus_send` MAX_BODY_BYTES (8KB) so any
+  message that successfully sent is delivered in full inline.
+
+## [0.3.0] — 2026-04-28
+
+### Added
+
+- **`bus_spawn_worker(name, brief)`** tool. Generates a self-contained
+  worker brief with the bus protocol baked in. Returns `spawn_task`
+  arguments ready to invoke. Eliminates the per-spawn boilerplate the
+  orchestrator used to write by hand.
+- **Inline-body delivery in hooks.** Both `UserPromptSubmit` and
+  `Stop` hooks read the unread messages and dump them into the
+  system-reminder directly. The orchestrator can act without an
+  extra `bus_inbox` round-trip.
+- **Protocol primer attached to `bus_claim` response.** A
+  freshly-started session learns the bus protocol from the tool
+  itself instead of needing the user to paste guidance.
+
+## [0.2.0] — 2026-04-28
+
+### Changed
+
+- **`bus_peers` shape.** Old: list of names. New: list of
+  `{name, alive, has_inbox, unread}`. `alive` reports whether at
+  least one Claude Code process currently holds the name.
+- Env-var identity (`CLAUDE_BUS_NAME=...`) now writes its own
+  `active/<ppid>.txt` at server startup, so terminal-flow sessions
+  appear in `bus_peers` consistently with claim-flow sessions.
+
+## [0.1.0] — 2026-04-25
+
+Initial release. Three tools (`bus_send`, `bus_inbox`, `bus_peers`),
+JSONL inbox per recipient, per-session byte-offset cursor, 8 KB body
+cap, strict name validation, `reply_to` threading. Two hooks
+(UserPromptSubmit + asyncRewake Stop). Identity via `CLAUDE_BUS_NAME`
+env or `bus_claim` (Mac-app flow).
