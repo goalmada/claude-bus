@@ -64,8 +64,9 @@ const assert = (cond, msg) => {
 const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
 const expectedTools = [
-  "bus_archive", "bus_claim", "bus_inbox", "bus_peers", "bus_revive",
-  "bus_scratch", "bus_send", "bus_spawn_worker", "bus_task", "bus_tasks",
+  "bus_archive", "bus_claim", "bus_delivery", "bus_inbox", "bus_peers",
+  "bus_revive", "bus_scratch", "bus_send", "bus_spawn_worker",
+  "bus_task", "bus_tasks",
 ];
 assert(JSON.stringify(names) === JSON.stringify(expectedTools),
   `tools listed: ${names.join(",")}`);
@@ -435,7 +436,85 @@ const peerNamesAfter = JSON.parse(peersAfterArchive.result.content[0].text)
 assert(!peerNamesAfter.includes("to-archive"),
   `archived name no longer in peers list: ${peerNamesAfter.join(",")}`);
 
-// 27. v0.6: invalid name on bus_revive is rejected.
+// 28. v0.10: bus_send response includes delivered_offset.
+assert(typeof sendPayload.delivered_offset === "number" &&
+       sendPayload.delivered_offset >= 0,
+  `delivered_offset is a non-negative integer: actual=${sendPayload.delivered_offset}`);
+
+// 29. v0.10: bus_send returns recipient_responsive (false in this harness
+//     because no hook is running to touch heartbeats).
+assert(sendPayload.recipient_responsive === false,
+  `recipient_responsive defaults to false absent heartbeat: actual=${sendPayload.recipient_responsive}`);
+
+// 30. v0.10: bus_delivery reports unread for fresh sends.
+const sendForDelivery = await auditor.call("tools/call", {
+  name: "bus_send",
+  arguments: { to: "uncool-recv", kind: "brief", body: "are you there?" },
+});
+const sendForDeliveryPayload = JSON.parse(sendForDelivery.result.content[0].text);
+const dCheck = await auditor.call("tools/call", {
+  name: "bus_delivery",
+  arguments: {
+    to: "uncool-recv",
+    offset: sendForDeliveryPayload.delivered_offset,
+  },
+});
+const dCheckPayload = JSON.parse(dCheck.result.content[0].text);
+assert(dCheckPayload.read === false,
+  `bus_delivery reports unread immediately after send: actual=${dCheckPayload.read}`);
+assert(typeof dCheckPayload.current_cursor === "number",
+  "bus_delivery returns current_cursor");
+
+// 31. v0.10: check_in_minutes is plumbed through bus_spawn_worker → task.
+const swCheckIn = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "long-runner",
+    brief: "Long task that needs a 90-min check-in deadline.",
+    check_in_minutes: 90,
+  },
+});
+const swCheckInPayload = JSON.parse(swCheckIn.result.content[0].text);
+const tCheckIn = await auditor.call("tools/call", {
+  name: "bus_task", arguments: { id: swCheckInPayload.task_id },
+});
+const tCheckInPayload = JSON.parse(tCheckIn.result.content[0].text);
+assert(typeof tCheckInPayload.check_in_at === "string",
+  "task has check_in_at when check_in_minutes is set");
+const expectedDelta = 90 * 60 * 1000;
+const actualDelta = new Date(tCheckInPayload.check_in_at).getTime() -
+                    new Date(tCheckInPayload.spawned_at).getTime();
+assert(Math.abs(actualDelta - expectedDelta) < 5000,
+  `check_in_at = spawned_at + 90min (within 5s tolerance): actual delta=${actualDelta}ms`);
+assert(tCheckInPayload.nudged_at === null,
+  "freshly-spawned task starts with nudged_at: null");
+
+// 32. v0.10: check_in_minutes: 0 disables check-in.
+const sw0 = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "no-check",
+    brief: "Worker that doesn't want a deadline (>= 10 chars).",
+    check_in_minutes: 0,
+  },
+});
+const sw0Payload = JSON.parse(sw0.result.content[0].text);
+const t0 = await auditor.call("tools/call", {
+  name: "bus_task", arguments: { id: sw0Payload.task_id },
+});
+const t0Payload = JSON.parse(t0.result.content[0].text);
+assert(t0Payload.check_in_at === null,
+  `check_in_minutes: 0 disables deadline: actual=${t0Payload.check_in_at}`);
+
+// 33. v0.10: bus_peers includes responsive field.
+const peersV10 = await auditor.call("tools/call", {
+  name: "bus_peers", arguments: {},
+});
+const peersV10Payload = JSON.parse(peersV10.result.content[0].text);
+assert(peersV10Payload.peers.every((p) => typeof p.responsive === "boolean"),
+  "every peer entry has a responsive boolean");
+
+// 34. v0.6: invalid name on bus_revive is rejected.
 //
 // (Note: a check for "revive on already-alive name flags target_was_alive"
 // would be ideal here, but in this test harness multiple "sessions" share

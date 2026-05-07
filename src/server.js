@@ -30,8 +30,12 @@ import {
   listTasks,
   markTasksClaimedFor,
   isPeerAlive,
+  isPeerResponsive,
+  getHeartbeatAge,
   archiveSession,
+  checkDelivery,
   MAX_BODY_BYTES,
+  HEARTBEAT_FRESHNESS_MS,
 } from "./storage.js";
 
 // Identity resolution, in order:
@@ -446,6 +450,21 @@ const TOOLS = [
             "CLAUDE_BUS_PROJECT_PREFIX env var, then to .claude-bus/" +
             "config.json walked up from cwd, then to plain 's:'.",
         },
+        check_in_minutes: {
+          type: "integer",
+          minimum: 0,
+          maximum: 60 * 24 * 7,
+          description:
+            "Minutes after spawn at which the bus will nudge YOU (the " +
+            "orchestrator) if this task hasn't been reported. The hook " +
+            "scans tasks every poll iteration; once a task's check_in_at " +
+            "is past and it isn't yet reported, you get a one-time " +
+            "system-reminder asking you to peek the inbox or send a " +
+            "status check. Default 30. Pass 0 to disable for tasks " +
+            "where you don't expect an explicit report. Tune up for " +
+            "long tasks ('check_in_minutes': 90 for a ~1-2 hour task).",
+          default: 30,
+        },
       },
       additionalProperties: false,
     },
@@ -606,10 +625,35 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "bus_delivery",
+    description:
+      "Check whether a message you previously bus_send'd has been read " +
+      "by the recipient. \"Read\" means the recipient's cursor has " +
+      "advanced past the message's byte offset — which happens whenever " +
+      "the recipient's UserPromptSubmit / Stop hook delivers the " +
+      "message inline, or when they explicitly call bus_inbox(). Pass " +
+      "the recipient name and the delivered_offset returned by your " +
+      "original bus_send. Returns {read: bool, current_cursor: int}.",
+    inputSchema: {
+      type: "object",
+      required: ["to", "offset"],
+      properties: {
+        to: { type: "string", description: "recipient session name" },
+        offset: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "delivered_offset returned by the original bus_send response.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.9.0" },
+  { name: "claude-bus", version: "0.10.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -705,6 +749,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         brief_summary: userBrief,
         long_running: longRunning,
         report_to: reportTo,
+        check_in_minutes: args.check_in_minutes,
       });
 
       const prompt = buildWorkerBrief({
@@ -764,12 +809,38 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // but the orchestrator needs to KNOW when its message landed in
       // a dead inbox so it can decide to bus_revive instead of waiting.
       const recipient_alive = await isPeerAlive(args.to);
+      const heartbeat_age_ms = await getHeartbeatAge(args.to);
+      // "Responsive" only when we have positive evidence the hook
+      // wrote a fresh heartbeat. Absent heartbeat = unknown, not
+      // not-responsive — pre-v0.10 sessions have no heartbeat at all.
+      const recipient_responsive =
+        heartbeat_age_ms !== null && heartbeat_age_ms <= HEARTBEAT_FRESHNESS_MS;
       const response = {
         ok: true,
         id: msg.id,
         delivered_at: msg.created_at,
+        delivered_offset: msg.delivered_offset,
         recipient_alive,
+        recipient_responsive,
       };
+      // Only warn when we have positive evidence the hook is broken
+      // (heartbeat file exists but is stale). Absent heartbeat is
+      // ambiguous — could be a legacy session, the hook's first
+      // heartbeat hasn't fired yet, etc.
+      if (
+        recipient_alive &&
+        heartbeat_age_ms !== null &&
+        heartbeat_age_ms > HEARTBEAT_FRESHNESS_MS
+      ) {
+        response.warning =
+          `Recipient "${args.to}" holds the name (alive) but its ` +
+          `asyncRewake hook hasn't touched its heartbeat in ` +
+          `${Math.round(heartbeat_age_ms / 1000)}s (threshold: ` +
+          `${HEARTBEAT_FRESHNESS_MS / 1000}s). Push is likely broken ` +
+          `for this session. Message is queued; if it stays unread ` +
+          `past ~5min, consider bus_revive("${args.to}") or check the ` +
+          `worker's window directly.`;
+      }
       if (!recipient_alive) {
         response.warning =
           `Recipient "${args.to}" is not currently alive on the bus. ` +
@@ -917,6 +988,19 @@ a memory restore.`;
       return {
         content: [{ type: "text", text: JSON.stringify(t, null, 2) }],
       };
+    }
+    if (name === "bus_delivery") {
+      try {
+        const result = await checkDelivery(args.to, args.offset);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `claude-bus error: ${err.message}` }],
+        };
+      }
     }
     if (name === "bus_archive") {
       try {

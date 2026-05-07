@@ -1,15 +1,24 @@
 // Storage primitives for claude-bus.
 //
 // State lives under ~/.claude-bus/
-//   inbox/<name>.jsonl   — append-only log of messages delivered to <name>
-//   cursor/<name>.txt    — byte offset into inbox/<name>.jsonl of the last
-//                          message this session has read
-//   active/<ppid>.txt    — identity claimed by the Claude Code session whose
-//                          PID is <ppid>. Used by the GUI app where the
-//                          CLAUDE_BUS_NAME env var can't be set per session.
+//   inbox/<name>.jsonl    — append-only log of messages delivered to <name>
+//   cursor/<name>.txt     — byte offset into inbox/<name>.jsonl of the last
+//                            message this session has read
+//   active/<ppid>.txt     — identity claimed by the Claude Code session whose
+//                            PID is <ppid>. Used by the GUI app where the
+//                            CLAUDE_BUS_NAME env var can't be set per session.
+//   tasks/<id>.json       — per-task state for bus_spawn_worker dispatches.
+//   heartbeat/<name>.txt  — last_seen mtime, touched by wait-for-mail.sh
+//                            every poll iteration. "Responsive" = mtime
+//                            within last 2 min. Distinct from "alive" (PID
+//                            holds the name); a session can be alive but
+//                            non-responsive if its hook isn't running.
+//   sent/<from>.jsonl     — outgoing-message tracking (one line per send),
+//                            scanned by the asyncRewake hook to detect
+//                            messages stuck unread past a threshold.
 //
-// Writers only ever append to inbox files. Readers only ever advance their
-// own cursor. No locks, no rewrites, no races.
+// Writers only ever append to inbox/sent files. Readers only ever advance
+// their own cursor. No locks, no rewrites, no races.
 
 import { promises as fs } from "node:fs";
 import {
@@ -29,10 +38,20 @@ const INBOX_DIR = path.join(ROOT, "inbox");
 const CURSOR_DIR = path.join(ROOT, "cursor");
 const ACTIVE_DIR = path.join(ROOT, "active");
 const TASKS_DIR = path.join(ROOT, "tasks");
+const HEARTBEAT_DIR = path.join(ROOT, "heartbeat");
+const SENT_DIR = path.join(ROOT, "sent");
 
-for (const dir of [ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR]) {
+for (const dir of [
+  ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR, HEARTBEAT_DIR, SENT_DIR,
+]) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
+
+// Heartbeat freshness threshold. A session is considered "responsive" if
+// its heartbeat file was touched within this window. Tuned to 120s so a
+// 3s-poll asyncRewake hook touching every iteration has plenty of margin
+// even if the system is briefly busy.
+export const HEARTBEAT_FRESHNESS_MS = 120 * 1000;
 
 export const MAX_BODY_BYTES = 8 * 1024;
 
@@ -89,7 +108,40 @@ export async function appendMessage({ from, to, kind, reply_to, body }) {
   };
 
   const line = JSON.stringify(msg) + "\n";
+
+  // Capture pre-append size so we know exactly where this line starts in
+  // the inbox file. The byte offset doubles as a read-receipt anchor:
+  // the message is "read" once the recipient's cursor advances past it.
+  let prevSize = 0;
+  try {
+    const st = await fs.stat(inboxPath(to));
+    prevSize = st.size;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
   await fs.appendFile(inboxPath(to), line, "utf8");
+  msg.delivered_offset = prevSize;
+  msg.delivered_size = Buffer.byteLength(line, "utf8");
+
+  // Log this send to the sender's outgoing-tracking file. The asyncRewake
+  // hook scans this on each poll iteration to detect messages stuck
+  // unread past the read-receipt threshold and surface them as nudges.
+  try {
+    const sentRecord = {
+      id: msg.id,
+      to,
+      kind,
+      delivered_at: msg.created_at,
+      delivered_offset: prevSize,
+    };
+    await fs.appendFile(
+      path.join(SENT_DIR, `${from}.jsonl`),
+      JSON.stringify(sentRecord) + "\n",
+      "utf8"
+    );
+  } catch {
+    // best-effort
+  }
 
   // If this is a result, link it to its task so the spawning orchestrator
   // can see status without re-deriving from inbox grep. Best-effort —
@@ -224,12 +276,20 @@ export async function listPeerInfo() {
     peers.set(name, { ...prev, alive: prev.alive || alive });
   }
 
-  // Attach unread counts.
+  // Attach unread counts and responsive state.
   const result = [];
   for (const [name, info] of peers.entries()) {
     let unread = 0;
     try { unread = await unreadCount(name); } catch {}
-    result.push({ name, alive: info.alive, has_inbox: info.has_inbox, unread });
+    let responsive = false;
+    try { responsive = await isPeerResponsive(name); } catch {}
+    result.push({
+      name,
+      alive: info.alive,
+      responsive,
+      has_inbox: info.has_inbox,
+      unread,
+    });
   }
   result.sort((a, b) => a.name.localeCompare(b.name));
   return result;
@@ -342,6 +402,7 @@ export async function createTask({
   brief_summary,
   long_running,
   report_to,
+  check_in_minutes,
 }) {
   assertName(owner, "owner");
   assertName(worker_name, "worker_name");
@@ -351,6 +412,14 @@ export async function createTask({
   if (!Array.isArray(report_to) || report_to.length === 0) {
     throw new Error("report_to must be a non-empty array");
   }
+  // Default check-in: 30 min after spawn. 0 disables it.
+  const minutes = check_in_minutes === undefined ? 30 : Number(check_in_minutes);
+  if (!Number.isFinite(minutes) || minutes < 0 || minutes > 60 * 24 * 7) {
+    throw new Error(
+      `invalid check_in_minutes: ${check_in_minutes} (must be 0..${60 * 24 * 7})`
+    );
+  }
+  const spawnedAt = new Date();
   const id = newTaskId();
   const task = {
     id,
@@ -360,7 +429,11 @@ export async function createTask({
     long_running: !!long_running,
     report_to,
     status: "spawned",
-    spawned_at: new Date().toISOString(),
+    spawned_at: spawnedAt.toISOString(),
+    check_in_at: minutes > 0
+      ? new Date(spawnedAt.getTime() + minutes * 60 * 1000).toISOString()
+      : null,
+    nudged_at: null,
     first_result_at: null,
     first_result_id: null,
   };
@@ -572,7 +645,131 @@ export async function maybeMarkTaskFromBody(body, result_message_id) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Heartbeat (lightweight responsive-check).
+// ---------------------------------------------------------------------------
+// The asyncRewake Stop hook (wait-for-mail.sh) calls touchHeartbeat() each
+// poll iteration. "Responsive" = mtime within HEARTBEAT_FRESHNESS_MS.
+// Distinct from "alive" — alive means a process holds the name, responsive
+// means the hook for that name is actively polling (i.e. push works).
+
+function heartbeatPath(name) {
+  return path.join(HEARTBEAT_DIR, `${name}.txt`);
+}
+
+export async function touchHeartbeat(name) {
+  assertName(name, "name");
+  // We don't care about contents; mtime is the signal. Open-write-close
+  // is faster and simpler than utime() when the file may not exist.
+  await fs.writeFile(heartbeatPath(name), "", "utf8");
+}
+
+export async function getHeartbeatAge(name) {
+  try {
+    const st = await fs.stat(heartbeatPath(name));
+    return Date.now() - st.mtimeMs;
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+export async function isPeerResponsive(name) {
+  const age = await getHeartbeatAge(name);
+  if (age === null) return false;
+  return age <= HEARTBEAT_FRESHNESS_MS;
+}
+
+// ---------------------------------------------------------------------------
+// Read receipts.
+// ---------------------------------------------------------------------------
+// A message is "read" once the recipient's cursor has advanced past the
+// byte offset where the message starts. We don't store a per-message
+// read_at timestamp — the cursor file IS the read marker.
+
+export async function checkDelivery(recipientName, messageOffset) {
+  if (typeof recipientName !== "string") {
+    throw new Error("recipientName must be a string");
+  }
+  if (typeof messageOffset !== "number" || messageOffset < 0) {
+    throw new Error("messageOffset must be a non-negative number");
+  }
+  let cursor = 0;
+  try {
+    const raw = await fs.readFile(cursorPath(recipientName), "utf8");
+    const n = parseInt(raw.trim(), 10);
+    if (Number.isFinite(n) && n >= 0) cursor = n;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  return { read: cursor > messageOffset, current_cursor: cursor };
+}
+
+// ---------------------------------------------------------------------------
+// Outgoing-tracking helpers (for the asyncRewake hook's stuck-message scan).
+// ---------------------------------------------------------------------------
+
+export async function listSentBy(senderName) {
+  try {
+    const raw = await fs.readFile(path.join(SENT_DIR, `${senderName}.jsonl`), "utf8");
+    return raw
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => {
+        try { return JSON.parse(l); } catch { return null; }
+      })
+      .filter(Boolean);
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task check-in (overdue scan).
+// ---------------------------------------------------------------------------
+// Used by the asyncRewake hook to surface tasks that are past their
+// check-in deadline without being reported. One nudge per task — once
+// nudged_at is set, future scans skip it.
+
+export async function findOverdueTasks(owner, nowMs = Date.now()) {
+  let entries = [];
+  try {
+    entries = await fs.readdir(TASKS_DIR);
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+  const result = [];
+  for (const f of entries) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const raw = await fs.readFile(path.join(TASKS_DIR, f), "utf8");
+      const t = JSON.parse(raw);
+      if (t.owner !== owner) continue;
+      if (t.status === "reported" || t.status === "archived") continue;
+      if (t.nudged_at) continue;
+      if (!t.check_in_at) continue;
+      if (new Date(t.check_in_at).getTime() > nowMs) continue;
+      result.push(t);
+    } catch {
+      // skip
+    }
+  }
+  result.sort((a, b) => a.check_in_at.localeCompare(b.check_in_at));
+  return result;
+}
+
+export async function markTaskNudged(id) {
+  const t = await getTask(id);
+  if (!t) return null;
+  if (t.nudged_at) return t;
+  t.nudged_at = new Date().toISOString();
+  await fs.writeFile(taskPath(id), JSON.stringify(t, null, 2), "utf8");
+  return t;
+}
+
 export const _paths = {
-  ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR,
-  inboxPath, cursorPath, activePath, taskPath,
+  ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR, HEARTBEAT_DIR, SENT_DIR,
+  inboxPath, cursorPath, activePath, taskPath, heartbeatPath,
 };
