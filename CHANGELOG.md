@@ -3,6 +3,43 @@
 All notable changes to claude-bus. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.0] — 2026-05-07
+
+Heartbeat prompt — proactive self-evaluation tick for orchestrators.
+
+### Added
+
+- **Heartbeat prompt.** When `CLAUDE_BUS_HEARTBEAT_MINUTES=N` (N>0)
+  is set on a session, the asyncRewake hook fires a wake every N
+  minutes with the prompt "🫀 heartbeat — anything worth doing right
+  now?" The model evaluates current state (in-flight tasks, recent
+  inbox traffic, the user's last goal) and either takes an action or
+  acknowledges "no-op, all quiet" and ends the turn cleanly.
+
+### Why
+
+v0.10's nudges are reactive — they fire when something happens
+(overdue task, stuck outgoing, new mail). The heartbeat is the
+proactive complement: even when nothing event-triggered has fired,
+periodically ask the orchestrator "is there anything to do?" Useful
+for unattended fan-outs (paired with v0.11 `bus_run_worker`) where
+the orchestrator should self-pace, and for long-running planning
+sessions where the model should periodically re-evaluate state.
+
+### Tradeoffs
+
+Each heartbeat tick is a model turn. At 30-min intervals that's 48
+turns/day; at 60-min, 24/day. Pick interval based on token budget.
+Off by default — the user explicitly opts in per session. The
+"either action or no-op briefly" framing in the prompt is intentional
+to keep null-state turns cheap.
+
+### State
+
+Per-session timestamp at `~/.claude-bus/heartbeat-fires/<name>.txt`.
+First-run initializes; first actual fire happens one full interval
+after that.
+
 ## [0.11.0] — 2026-05-07
 
 Headless worker spawning for unattended fan-outs.

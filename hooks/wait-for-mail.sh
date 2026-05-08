@@ -67,6 +67,59 @@ touch_heartbeat() {
 
 # Scan task registry for overdue tasks and stuck outgoing messages.
 # Returns rendered reminder text on stdout if anything fires, empty otherwise.
+# Periodic heartbeat tick. Off by default (interval=0). When the env
+# CLAUDE_BUS_HEARTBEAT_MINUTES > 0, fires a wake every N minutes
+# prompting the orchestrator to self-evaluate ("anything worth doing
+# right now?"). Each tick is a model turn — picks have token cost.
+# Tracked via ~/.claude-bus/heartbeat-fires/<name>.txt (unix timestamp
+# of last fire). First run initializes the timestamp; first actual
+# fire happens one full interval after that.
+scan_for_heartbeat() {
+  local interval_min="${CLAUDE_BUS_HEARTBEAT_MINUTES:-0}"
+  [ "$interval_min" -gt 0 ] || return 0
+
+  mkdir -p "$root/heartbeat-fires"
+  local hb_file="$root/heartbeat-fires/$name.txt"
+  local now
+  now=$(date +%s)
+  local interval_sec=$((interval_min * 60))
+
+  local last
+  if [ -f "$hb_file" ]; then
+    last=$(cat "$hb_file" 2>/dev/null | tr -d ' ')
+    [ -n "$last" ] || last=0
+  else
+    # First time we see this session — initialize, do not fire.
+    echo "$now" > "$hb_file"
+    return 0
+  fi
+
+  local elapsed=$((now - last))
+  if [ "$elapsed" -lt "$interval_sec" ]; then
+    return 0
+  fi
+
+  # Fire. Stamp the new timestamp BEFORE rendering so a re-fire from
+  # a slow model doesn't double-trigger.
+  echo "$now" > "$hb_file"
+
+  local mins_since=$((elapsed / 60))
+  cat <<HEARTBEAT
+🫀 heartbeat — anything worth doing right now?
+
+It's been ~${mins_since} minutes since your last heartbeat tick. Look at:
+  • bus_tasks() — what's still in flight, what's stuck
+  • bus_peers() — which workers are alive and responsive
+  • bus_inbox(peek: true) — recent traffic you may want to follow up on
+  • The user's most recent goal — what were they trying to accomplish?
+
+If there's a useful move — spawn a worker, ping a stuck one, synthesize
+recent findings, surface a status update — take it. If nothing has
+materially changed and no action is warranted, just say "no-op, all
+quiet" briefly and end your turn cleanly. Either response is correct.
+HEARTBEAT
+}
+
 scan_for_nudges() {
   node -e '
     const fs = require("fs");
@@ -187,6 +240,14 @@ while true; do
     if [ -n "$nudges" ]; then
       notify "claude-bus" "$name has overdue task or stuck message"
       echo "$nudges"
+      exit 2
+    fi
+
+    # Then the proactive heartbeat (off by default; set
+    # CLAUDE_BUS_HEARTBEAT_MINUTES=N to enable for this session).
+    heartbeat=$(scan_for_heartbeat || true)
+    if [ -n "$heartbeat" ]; then
+      echo "$heartbeat"
       exit 2
     fi
   fi

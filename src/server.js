@@ -747,7 +747,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.11.0" },
+  { name: "claude-bus", version: "0.12.0" },
   { capabilities: { tools: {} } }
 );
 
