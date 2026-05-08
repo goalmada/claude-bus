@@ -351,6 +351,7 @@ v0.10 catches each with:
 | Long-idle orchestrator fell off the watch list | Default `CLAUDE_BUS_WAIT_SECONDS` = 7 days; on timeout, macOS notification self-diagnoses ("submit any prompt to re-arm"). v0.9 + v0.10. |
 | Result body too long for inline-render | Hook caps per-message at 8 KB and points at `bus_inbox(peek: true)` for full re-read. v0.4. |
 | Bus state cluttered with finished workers | `bus_archive(name)` removes inbox/cursor and flips matching tasks to `archived`. v0.9. |
+| Need to fan out while user is away (no clicks possible) | `bus_run_worker(name, brief)` forks a headless `claude -p` subprocess. Off by default; requires `CLAUDE_BUS_AUTO_SPAWN=1` opt-in. Capped at 5 concurrent. Audit log + per-worker stdout capture. v0.11. |
 
 The dedup invariants (`nudged_at` on tasks, `_nudged` on outgoing
 records, `reminded/<task>.txt` for worker-side guard) ensure each

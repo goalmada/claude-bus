@@ -40,9 +40,13 @@ const ACTIVE_DIR = path.join(ROOT, "active");
 const TASKS_DIR = path.join(ROOT, "tasks");
 const HEARTBEAT_DIR = path.join(ROOT, "heartbeat");
 const SENT_DIR = path.join(ROOT, "sent");
+const AUTO_PIDS_DIR = path.join(ROOT, "auto-spawn-pids");
+const AUTO_LOGS_DIR = path.join(ROOT, "auto-spawn-logs");
+const AUTO_AUDIT_LOG = path.join(ROOT, "auto-spawn-audit.log");
 
 for (const dir of [
   ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR, HEARTBEAT_DIR, SENT_DIR,
+  AUTO_PIDS_DIR, AUTO_LOGS_DIR,
 ]) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
@@ -769,7 +773,88 @@ export async function markTaskNudged(id) {
   return t;
 }
 
+// ---------------------------------------------------------------------------
+// Auto-spawn (headless worker) bookkeeping.
+// ---------------------------------------------------------------------------
+// bus_run_worker forks a `claude -p` subprocess that does work without a
+// human approval click. Three guardrails:
+//   1. Off by default. Requires CLAUDE_BUS_AUTO_SPAWN=1 in env OR
+//      ~/.claude-bus/auto-spawn.on file (touch it to enable).
+//   2. Concurrency cap. Default 5 simultaneous headless workers; raise
+//      via CLAUDE_BUS_MAX_AUTO=N.
+//   3. Audit log. Every spawn appends to ~/.claude-bus/auto-spawn-audit.log.
+
+export function isAutoSpawnEnabled() {
+  if (process.env.CLAUDE_BUS_AUTO_SPAWN) return true;
+  try {
+    return existsSync(path.join(ROOT, "auto-spawn.on"));
+  } catch {
+    return false;
+  }
+}
+
+export function autoSpawnMaxConcurrent() {
+  const fromEnv = parseInt(process.env.CLAUDE_BUS_MAX_AUTO || "", 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return 5;
+}
+
+export async function listLiveAutoSpawns() {
+  let entries;
+  try {
+    entries = await fs.readdir(AUTO_PIDS_DIR);
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+  const live = [];
+  for (const f of entries) {
+    if (!f.endsWith(".txt")) continue;
+    const taskId = f.slice(0, -4);
+    let pid;
+    try {
+      pid = parseInt((await fs.readFile(path.join(AUTO_PIDS_DIR, f), "utf8")).trim(), 10);
+    } catch { continue; }
+    if (!Number.isFinite(pid)) continue;
+    let alive = true;
+    try { process.kill(pid, 0); }
+    catch (err) { alive = err.code !== "ESRCH"; }
+    if (alive) {
+      live.push({ task_id: taskId, pid });
+    } else {
+      // Best-effort cleanup of stale PID file.
+      try { await fs.unlink(path.join(AUTO_PIDS_DIR, f)); } catch {}
+    }
+  }
+  return live;
+}
+
+export async function recordAutoSpawnPid(taskId, pid) {
+  await fs.writeFile(
+    path.join(AUTO_PIDS_DIR, `${taskId}.txt`),
+    String(pid),
+    "utf8"
+  );
+}
+
+export function autoSpawnLogPath(taskId) {
+  return path.join(AUTO_LOGS_DIR, `${taskId}.log`);
+}
+
+export async function appendAutoSpawnAudit(entry) {
+  const line = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    ...entry,
+  }) + "\n";
+  try {
+    await fs.appendFile(AUTO_AUDIT_LOG, line, "utf8");
+  } catch {
+    // best-effort; never break a spawn because audit log failed
+  }
+}
+
 export const _paths = {
   ROOT, INBOX_DIR, CURSOR_DIR, ACTIVE_DIR, TASKS_DIR, HEARTBEAT_DIR, SENT_DIR,
+  AUTO_PIDS_DIR, AUTO_LOGS_DIR, AUTO_AUDIT_LOG,
   inboxPath, cursorPath, activePath, taskPath, heartbeatPath,
 };

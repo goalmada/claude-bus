@@ -3,6 +3,51 @@
 All notable changes to claude-bus. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] — 2026-05-07
+
+Headless worker spawning for unattended fan-outs.
+
+### Added
+
+- **`bus_run_worker(name, brief, opts?)`** tool. Forks a `claude -p`
+  subprocess that runs the brief autonomously and `bus_send`s a
+  result back when done. No chip, no click — for the case where the
+  user has walked away and explicitly asked the orchestrator to fan
+  out without their input. Workers are one-shot (no `long_running`
+  — `claude -p` is print mode).
+
+### Safety profile
+
+`bus_run_worker` bypasses the chip-click human approval gate that
+`bus_spawn_worker` provides. Three guardrails:
+
+1. **Off by default.** Requires `CLAUDE_BUS_AUTO_SPAWN=1` in env OR
+   `touch ~/.claude-bus/auto-spawn.on`. Without one of those, the
+   tool errors with a clear message naming the gate.
+2. **Concurrency cap.** Default 5 simultaneous headless workers.
+   Tracked via `~/.claude-bus/auto-spawn-pids/<task-id>.txt`. Raise
+   with `CLAUDE_BUS_MAX_AUTO=N`.
+3. **Hard runtime timeout.** Default 1800s (30 min); max 4 hours.
+   Subprocess is `SIGTERM`'d if it runs longer.
+
+### Audit
+
+- Every spawn appends a JSON line to `~/.claude-bus/auto-spawn-audit.log`
+  with timestamp, task_id, owner, worker_name, pid, cwd, permission_mode,
+  brief snippet (first 200 chars).
+- Per-worker stdout/stderr captured to
+  `~/.claude-bus/auto-spawn-logs/<task-id>.log` for post-mortem
+  debugging when the user comes back.
+
+### Convention
+
+Protocol primer instructs the orchestrator to prefer `bus_spawn_worker`
+when the user is engaged at the keyboard (chip click is a useful
+human review of the brief) and only switch to `bus_run_worker` when
+the user has explicitly said they're walking away. The orchestrator
+should also reset to `bus_spawn_worker` when the user returns and
+engages again.
+
 ## [0.10.0] — 2026-05-07
 
 The "stuck worker detection" failure class is closed. Four tightly-coupled

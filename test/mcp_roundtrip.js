@@ -65,8 +65,8 @@ const tools = await auditor.call("tools/list");
 const names = tools.result.tools.map((t) => t.name).sort();
 const expectedTools = [
   "bus_archive", "bus_claim", "bus_delivery", "bus_inbox", "bus_peers",
-  "bus_revive", "bus_scratch", "bus_send", "bus_spawn_worker",
-  "bus_task", "bus_tasks",
+  "bus_revive", "bus_run_worker", "bus_scratch", "bus_send",
+  "bus_spawn_worker", "bus_task", "bus_tasks",
 ];
 assert(JSON.stringify(names) === JSON.stringify(expectedTools),
   `tools listed: ${names.join(",")}`);
@@ -514,7 +514,32 @@ const peersV10Payload = JSON.parse(peersV10.result.content[0].text);
 assert(peersV10Payload.peers.every((p) => typeof p.responsive === "boolean"),
   "every peer entry has a responsive boolean");
 
-// 34. v0.6: invalid name on bus_revive is rejected.
+// 35. v0.11: bus_run_worker refuses by default (auto-spawn off).
+const runRefused = await auditor.call("tools/call", {
+  name: "bus_run_worker",
+  arguments: {
+    name: "auto-test",
+    brief: "headless worker test that should be refused without opt-in",
+  },
+});
+assert(runRefused.result.isError === true,
+  "bus_run_worker errors when auto-spawn is disabled");
+assert((runRefused.result.content[0].text || "").includes("Auto-spawn is disabled"),
+  "error message names the gate clearly");
+assert((runRefused.result.content[0].text || "").includes("CLAUDE_BUS_AUTO_SPAWN"),
+  "error message tells user how to enable");
+
+// 36. v0.11: invalid name still rejected even with auto-spawn opt-in
+//     check (we touch the on-flag in the test HOME and try a bad name).
+await fs.writeFile(path.join(tmp, ".claude-bus", "auto-spawn.on"), "");
+const runBadName = await auditor.call("tools/call", {
+  name: "bus_run_worker",
+  arguments: { name: "../evil", brief: "ten chars min for the brief" },
+});
+assert(runBadName.result.isError === true,
+  "bus_run_worker rejects path-traversal name even when auto-spawn is on");
+
+// 37. v0.6: invalid name on bus_revive is rejected.
 //
 // (Note: a check for "revive on already-alive name flags target_was_alive"
 // would be ideal here, but in this test harness multiple "sessions" share

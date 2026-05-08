@@ -34,6 +34,12 @@ import {
   getHeartbeatAge,
   archiveSession,
   checkDelivery,
+  isAutoSpawnEnabled,
+  autoSpawnMaxConcurrent,
+  listLiveAutoSpawns,
+  recordAutoSpawnPid,
+  autoSpawnLogPath,
+  appendAutoSpawnAudit,
   MAX_BODY_BYTES,
   HEARTBEAT_FRESHNESS_MS,
 } from "./storage.js";
@@ -140,7 +146,17 @@ const PROTOCOL_PRIMER = `You are now identified on claude-bus. Quick protocol:
   inbox, cursor, and tasks marked archived. Refuses if the worker is
   still alive; in that case either close the window first or
   bus_send the worker an explicit "you can close" so it knows to exit
-  cleanly.`;
+  cleanly.
+
+• If the user has explicitly said they're walking away and asked you
+  to fan out without their input, use bus_run_worker instead of
+  bus_spawn_worker. bus_run_worker forks a headless "claude -p"
+  subprocess — no chip, no click. It's off by default; if it errors
+  with "Auto-spawn is disabled," tell the user how to enable it
+  (either CLAUDE_BUS_AUTO_SPAWN=1 in shell or touch ~/.claude-bus/
+  auto-spawn.on). Workers are one-shot and capped at 5 concurrent.
+  When the user is at the keyboard and engaged, prefer bus_spawn_worker
+  — the chip click is a useful human review of your brief.`;
 
 // Strict report template every worker uses for its result body. Stamping
 // structure at message-creation time means the orchestrator surfaces
@@ -650,10 +666,88 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "bus_run_worker",
+    description:
+      "HEADLESS variant of bus_spawn_worker. Forks a `claude -p` " +
+      "subprocess that runs the brief autonomously and bus_sends a " +
+      "result back when done — no chip, no human click required. Use " +
+      "this when the user has explicitly said they're walking away " +
+      "and asked you to fan out without their input. SAFETY PROFILE " +
+      "DIFFERS from bus_spawn_worker: the chip click is the human " +
+      "approval gate; bus_run_worker bypasses it. Workers are one-shot " +
+      "(no long_running — `claude -p` is print mode). Off by default; " +
+      "requires CLAUDE_BUS_AUTO_SPAWN=1 env or " +
+      "~/.claude-bus/auto-spawn.on file. Capped at 5 concurrent " +
+      "(CLAUDE_BUS_MAX_AUTO=N to raise). Every spawn is appended to " +
+      "~/.claude-bus/auto-spawn-audit.log.",
+    inputSchema: {
+      type: "object",
+      required: ["name", "brief"],
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Bus name for the headless worker. 1-64 chars, " +
+            "[a-zA-Z0-9_-] only.",
+        },
+        brief: {
+          type: "string",
+          description:
+            "Plain-English description of what the worker should do. " +
+            "Worker has no memory of you — include everything.",
+        },
+        max_runtime_seconds: {
+          type: "integer",
+          minimum: 30,
+          maximum: 60 * 60 * 4,
+          default: 1800,
+          description:
+            "Hard timeout. Subprocess is killed if it runs longer. " +
+            "Default 1800 (30 min). Max 4 hours.",
+        },
+        permission_mode: {
+          type: "string",
+          enum: ["bypassPermissions", "acceptEdits", "plan"],
+          default: "bypassPermissions",
+          description:
+            "Passed to `claude -p` --permission-mode. Default " +
+            "'bypassPermissions' (no interactive prompts; worker can " +
+            "act freely). Use 'acceptEdits' for slightly tighter " +
+            "scope, 'plan' to limit to plan-only output.",
+        },
+        cwd: {
+          type: "string",
+          description:
+            "Working directory for the subprocess. Defaults to the " +
+            "orchestrator's cwd. Pass an absolute path if the worker " +
+            "needs to operate in a specific repo.",
+        },
+        report_to: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional list of session names to send the structured " +
+            "report to. Defaults to [<your-name>].",
+        },
+        check_in_minutes: {
+          type: "integer",
+          minimum: 0,
+          maximum: 60 * 24 * 7,
+          default: 30,
+          description:
+            "Same semantics as bus_spawn_worker.check_in_minutes — if " +
+            "the headless worker doesn't report by this deadline, " +
+            "your asyncRewake hook will surface a nudge.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.10.0" },
+  { name: "claude-bus", version: "0.11.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -788,6 +882,144 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
                   "The user will see a chip and click to start the worker. " +
                   `When the worker reports back, the result will appear in ${reportTo.length === 1 ? `your inbox ("${reportTo[0]}")` : `the inboxes of: ${reportTo.join(", ")}`} automatically and task ${task.id} will be marked reported. ` +
                   "Use bus_tasks() at any time to see what's outstanding (helpful after compaction).",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    if (name === "bus_run_worker") {
+      const workerName = args.name;
+      const userBrief = args.brief;
+      const maxRuntime = Number.isFinite(args.max_runtime_seconds)
+        ? args.max_runtime_seconds : 1800;
+      const permissionMode = args.permission_mode || "bypassPermissions";
+      const reportTo = Array.isArray(args.report_to) && args.report_to.length > 0
+        ? args.report_to
+        : [SELF];
+      const cwd = args.cwd || process.cwd();
+
+      // Validation.
+      if (typeof workerName !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(workerName)) {
+        throw new Error(
+          `invalid worker name "${workerName}": must be 1-64 chars, [a-zA-Z0-9_-] only`
+        );
+      }
+      if (typeof userBrief !== "string" || userBrief.trim().length < 10) {
+        throw new Error("brief must be a non-empty string of at least 10 chars");
+      }
+      for (const r of reportTo) {
+        if (typeof r !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(r)) {
+          throw new Error(`invalid report_to entry "${r}"`);
+        }
+      }
+
+      // Safety gate 1: explicit opt-in.
+      if (!isAutoSpawnEnabled()) {
+        throw new Error(
+          "Auto-spawn is disabled. Headless workers bypass the chip-click " +
+          "human approval gate, so they require explicit opt-in. To enable: " +
+          "either `export CLAUDE_BUS_AUTO_SPAWN=1` in your shell before " +
+          "launching Claude Code, or `touch ~/.claude-bus/auto-spawn.on` " +
+          "(persists across restarts). Once enabled, you remain consenting " +
+          "until you remove the env var or delete the file."
+        );
+      }
+
+      // Safety gate 2: concurrency cap.
+      const live = await listLiveAutoSpawns();
+      const cap = autoSpawnMaxConcurrent();
+      if (live.length >= cap) {
+        throw new Error(
+          `Auto-spawn cap of ${cap} concurrent headless workers reached. ` +
+          `Currently live: ${live.map((l) => l.task_id).join(", ")}. ` +
+          `Wait for one to finish or raise via CLAUDE_BUS_MAX_AUTO=N.`
+        );
+      }
+
+      // Create task record (same shape as bus_spawn_worker for symmetry).
+      const task = await createTask({
+        owner: SELF,
+        worker_name: workerName,
+        brief_summary: userBrief,
+        long_running: false,    // headless is one-shot
+        report_to: reportTo,
+        check_in_minutes: args.check_in_minutes,
+      });
+
+      // Build the worker's prompt — same brief shape as bus_spawn_worker
+      // so the worker behaves the same way (claim, do, report).
+      const prompt = buildWorkerBrief({
+        workerName,
+        orchestratorName: SELF,
+        userBrief,
+        longRunning: false,
+        reportTo,
+        taskId: task.id,
+      });
+
+      // Fork `claude -p` subprocess. Detached so it survives if our MCP
+      // server gets reaped, with stdout/stderr captured to a log file.
+      const logPath = autoSpawnLogPath(task.id);
+      const logFd = fsSync.openSync(logPath, "a");
+
+      const claudeArgs = [
+        "--permission-mode", permissionMode,
+        "-p", prompt,
+      ];
+
+      const child = childSpawn("claude", claudeArgs, {
+        cwd,
+        env: { ...process.env, CLAUDE_BUS_NAME: workerName },
+        stdio: ["ignore", logFd, logFd],
+        detached: true,
+      });
+      child.unref();
+
+      try { fsSync.closeSync(logFd); } catch {}
+
+      // Record the PID for concurrency tracking.
+      await recordAutoSpawnPid(task.id, child.pid);
+
+      // Audit log.
+      await appendAutoSpawnAudit({
+        task_id: task.id,
+        owner: SELF,
+        worker_name: workerName,
+        pid: child.pid,
+        cwd,
+        permission_mode: permissionMode,
+        max_runtime_seconds: maxRuntime,
+        brief_summary: userBrief.slice(0, 200),
+      });
+
+      // Hard timeout: a separate setTimeout that kills the child if it
+      // exceeds maxRuntime. We don't await this — it runs in background.
+      setTimeout(() => {
+        try { process.kill(child.pid, "SIGTERM"); } catch {}
+      }, maxRuntime * 1000).unref?.();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: true,
+                task_id: task.id,
+                pid: child.pid,
+                worker_name: workerName,
+                log_path: logPath,
+                live_auto_spawns: live.length + 1,
+                cap,
+                next_step:
+                  `Headless worker started. The bus will auto-mark task ${task.id} ` +
+                  `as 'reported' when the worker bus_sends its result. You'll be ` +
+                  `woken via the asyncRewake hook on result arrival. If the worker ` +
+                  `doesn't report within check_in_minutes, you'll get a nudge. ` +
+                  `Stdout/stderr captured to ${logPath} for debugging.`,
               },
               null,
               2
