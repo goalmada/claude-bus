@@ -3,6 +3,49 @@
 All notable changes to claude-bus. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.0] — 2026-05-08
+
+Mitigation for an upstream Claude Code bug: `spawn_task` chips that
+silently fail to render in the Mac app's "Suggested task" panel when
+the same session name is targeted multiple times in succession.
+
+### Changed
+
+- **`bus_spawn_worker` hard-refuses when the target name is already
+  alive on the bus.** Previously it would happily issue spawn_task
+  args for a name that already had a live session, producing a
+  redundant chip. Now it errors with a message pointing at
+  `bus_send` (the right tool for messaging an existing worker) or
+  suggesting a fresh name (e.g. `<name>-2`) if the orchestrator
+  truly wants a separate worker.
+- **`bus_run_worker` hard-refuses on the same condition.** Same
+  reasoning. Avoids redundant headless processes for an already-
+  serving name.
+- **`bus_revive` hard-refuses when the target is already alive.**
+  Pre-v0.13 it soft-warned in the chip's `tldr` and still issued
+  the chip. The empirical pattern was that reviving alive workers
+  is the most reliable trigger for the Claude Code chip-not-
+  rendering bug, AND it's semantically wrong (nothing died — there's
+  nothing to revive). Now the tool throws an error instead of
+  generating a redundant chip.
+
+### Why this matters
+
+This doesn't fix the Claude Code rendering issue itself — that's an
+upstream bug we filed separately. What it does: cuts off the most
+reliable trigger from our side. The orchestrator can no longer
+accidentally issue redundant chips for live names; it has to either
+`bus_send` to the existing session or pick a different name. Result:
+fewer chips dropped on the floor, fewer "I sent it but the user
+never saw it" surprises.
+
+### Tests
+
+138 pass (was 130). New assertions: refusal fires + names the
+correct alternative + points at `bus_send` for all three tools, with
+a re-claim setup that makes `tester-1` honestly alive in the
+harness despite shared-ppid limitations.
+
 ## [0.12.1] — 2026-05-07
 
 ### Fixed

@@ -747,7 +747,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "claude-bus", version: "0.12.0" },
+  { name: "claude-bus", version: "0.13.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -835,6 +835,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
       }
 
+      // v0.13: refuse to spawn when a session with this name is already
+      // alive. Issuing a redundant chip is a known trigger for the
+      // chip-not-rendering bug in Claude Code's spawn_task UI panel,
+      // and it's almost never what the orchestrator actually wants —
+      // if the worker is alive, message it via bus_send instead of
+      // queueing another chip for the user to click.
+      if (await isPeerAlive(workerName)) {
+        throw new Error(
+          `A session named "${workerName}" is already alive on the bus. ` +
+          `Don't spawn a redundant chip — instead use bus_send({to: ` +
+          `"${workerName}", kind: "brief", body: "..."}) to dispatch the ` +
+          `new task to the existing session. If you genuinely want a ` +
+          `separate worker, pick a different name (e.g. "${workerName}-2").`
+        );
+      }
+
       // Record the task BEFORE generating the brief so we can embed the
       // task id into the report template the worker will use.
       const task = await createTask({
@@ -914,6 +930,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (typeof r !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(r)) {
           throw new Error(`invalid report_to entry "${r}"`);
         }
+      }
+
+      // v0.13: refuse to spawn when a session with this name is already
+      // alive. Same reasoning as bus_spawn_worker — don't issue a
+      // redundant chip / process for a name that's already serving.
+      if (await isPeerAlive(workerName)) {
+        throw new Error(
+          `A session named "${workerName}" is already alive on the bus. ` +
+          `Use bus_send({to: "${workerName}", kind: "brief", body: "..."}) ` +
+          `to dispatch the new task to the existing session, OR pick a ` +
+          `different name for a genuinely separate worker.`
+        );
       }
 
       // Safety gate 1: explicit opt-in.
@@ -1117,7 +1145,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           `invalid name "${targetName}": must be 1-64 chars, [a-zA-Z0-9_-] only`
         );
       }
-      const stillAlive = await isPeerAlive(targetName);
+
+      // v0.13: hard-refuse if target is already alive. Reviving an
+      // alive worker is a known reliable trigger for the chip-not-
+      // rendering bug in Claude Code's spawn_task UI panel, AND it's
+      // semantically wrong — there's nothing to revive. Pre-v0.13 the
+      // tool soft-warned in the tldr; that wasn't enough to keep the
+      // orchestrator from issuing the redundant chip. Now it errors.
+      if (await isPeerAlive(targetName)) {
+        throw new Error(
+          `Cannot revive "${targetName}": a session is currently alive ` +
+          `holding that name. Reviving an alive worker is semantically ` +
+          `wrong (nothing died) AND it reliably triggers a chip-not-` +
+          `rendering issue in Claude Code's spawn_task panel. Use ` +
+          `bus_send({to: "${targetName}", kind: "brief", body: "..."}) ` +
+          `to dispatch new work to the existing session.`
+        );
+      }
+
       const followUpBlock = followUp
         ? `\n\nFollow-up note from ${SELF} (use this in addition to the inbox history):\n${followUp}\n`
         : "";
@@ -1145,9 +1190,10 @@ the history is unclear, send kind: "question" to ${SELF} for
 clarification rather than guessing. This is a continuity hand-off, not
 a memory restore.`;
 
-      const tldr = stillAlive
-        ? `Note: "${targetName}" appears to be alive already. Reviving anyway will create a second claimant. You probably want to bus_send instead.`
-        : `Revives the dead "${targetName}" session by spawning a fresh worker that re-claims the name and reads inbox history as context.`;
+      // Past the v0.13 alive-refusal check, target is definitively dead.
+      const tldr =
+        `Revives the dead "${targetName}" session by spawning a fresh ` +
+        `worker that re-claims the name and reads inbox history as context.`;
 
       return {
         content: [
@@ -1157,7 +1203,7 @@ a memory restore.`;
               {
                 ok: true,
                 target_name: targetName,
-                target_was_alive: stillAlive,
+                target_was_alive: false,
                 spawn_task_args: {
                   title: chipTitle({
                     name: targetName,

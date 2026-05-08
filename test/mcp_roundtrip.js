@@ -539,7 +539,54 @@ const runBadName = await auditor.call("tools/call", {
 assert(runBadName.result.isError === true,
   "bus_run_worker rejects path-traversal name even when auto-spawn is on");
 
-// 37. v0.6: invalid name on bus_revive is rejected.
+// v0.13 collision tests need tester-1 to be the LAST writer to the
+// shared active file (intermediate tests have re-claimed other names,
+// so we re-claim tester-1 here to make isPeerAlive("tester-1") true).
+await tester.call("tools/call", {
+  name: "bus_claim", arguments: { name: "tester-1" },
+});
+
+// 38. v0.13: bus_spawn_worker refuses when target name is already alive.
+const swCollision = await auditor.call("tools/call", {
+  name: "bus_spawn_worker",
+  arguments: {
+    name: "tester-1",
+    brief: "this should be refused because tester-1 is alive",
+  },
+});
+assert(swCollision.result.isError === true,
+  "bus_spawn_worker refuses when name is already alive");
+assert((swCollision.result.content[0].text || "").includes("already alive"),
+  "refusal message names the live-collision condition");
+assert((swCollision.result.content[0].text || "").includes("bus_send"),
+  "refusal message points at bus_send as the right alternative");
+
+// 39. v0.13: bus_revive refuses when target is already alive.
+const reviveCollision = await auditor.call("tools/call", {
+  name: "bus_revive", arguments: { name: "tester-1" },
+});
+assert(reviveCollision.result.isError === true,
+  "bus_revive refuses when target is already alive");
+assert((reviveCollision.result.content[0].text || "").includes("Cannot revive"),
+  "refusal message identifies the operation as 'cannot revive'");
+assert((reviveCollision.result.content[0].text || "").includes("bus_send"),
+  "refusal message points at bus_send as the alternative");
+
+// 40. v0.13: bus_run_worker also refuses when name is alive (auto-spawn
+//     gate fires first only if disabled; here it's enabled from test 36).
+const runCollision = await auditor.call("tools/call", {
+  name: "bus_run_worker",
+  arguments: {
+    name: "tester-1",
+    brief: "this should be refused because tester-1 is alive",
+  },
+});
+assert(runCollision.result.isError === true,
+  "bus_run_worker refuses when name is already alive");
+assert((runCollision.result.content[0].text || "").includes("already alive"),
+  "bus_run_worker refusal names the live-collision condition");
+
+// 41. v0.6: invalid name on bus_revive is rejected.
 //
 // (Note: a check for "revive on already-alive name flags target_was_alive"
 // would be ideal here, but in this test harness multiple "sessions" share
