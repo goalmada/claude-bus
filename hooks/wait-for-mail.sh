@@ -67,16 +67,39 @@ touch_heartbeat() {
 
 # Scan task registry for overdue tasks and stuck outgoing messages.
 # Returns rendered reminder text on stdout if anything fires, empty otherwise.
-# Periodic heartbeat tick. Off by default (interval=0). When the env
-# CLAUDE_BUS_HEARTBEAT_MINUTES > 0, fires a wake every N minutes
-# prompting the orchestrator to self-evaluate ("anything worth doing
-# right now?"). Each tick is a model turn — picks have token cost.
+# Periodic heartbeat tick. Off by default (interval=0). When enabled,
+# fires a wake every N minutes prompting the orchestrator to self-
+# evaluate ("anything worth doing right now?"). Each tick is a model
+# turn — has token cost.
+#
+# Configuration resolution (first match wins):
+#   1. CLAUDE_BUS_HEARTBEAT_MINUTES env var          — terminal flow
+#   2. ~/.claude-bus/heartbeat-config/<name>.txt     — per-session, Mac app flow
+#   3. ~/.claude-bus/heartbeat-config/_default.txt   — machine-wide fallback
+#
+# Each config source is just an integer (minutes). 0 or unset = off.
+#
 # Tracked via ~/.claude-bus/heartbeat-fires/<name>.txt (unix timestamp
 # of last fire). First run initializes the timestamp; first actual
 # fire happens one full interval after that.
 scan_for_heartbeat() {
-  local interval_min="${CLAUDE_BUS_HEARTBEAT_MINUTES:-0}"
-  [ "$interval_min" -gt 0 ] || return 0
+  local interval_min=0
+
+  # Tier 1: env var (terminal flow).
+  if [ -n "${CLAUDE_BUS_HEARTBEAT_MINUTES:-}" ]; then
+    interval_min="$CLAUDE_BUS_HEARTBEAT_MINUTES"
+  # Tier 2: per-session config file (Mac app flow).
+  elif [ -f "$root/heartbeat-config/$name.txt" ]; then
+    interval_min=$(cat "$root/heartbeat-config/$name.txt" 2>/dev/null | tr -d ' ')
+  # Tier 3: machine-wide default file.
+  elif [ -f "$root/heartbeat-config/_default.txt" ]; then
+    interval_min=$(cat "$root/heartbeat-config/_default.txt" 2>/dev/null | tr -d ' ')
+  fi
+
+  # Validate — must be positive integer. Anything else = off.
+  if ! [[ "$interval_min" =~ ^[0-9]+$ ]] || [ "$interval_min" -le 0 ]; then
+    return 0
+  fi
 
   mkdir -p "$root/heartbeat-fires"
   local hb_file="$root/heartbeat-fires/$name.txt"

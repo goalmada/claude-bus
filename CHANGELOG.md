@@ -3,6 +3,25 @@
 All notable changes to claude-bus. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.1] — 2026-05-07
+
+### Fixed
+
+- **Heartbeat config now works in the Mac app flow.** v0.12 only read
+  the interval from `CLAUDE_BUS_HEARTBEAT_MINUTES` env var, which
+  doesn't propagate to GUI Claude Code launched from the Dock or
+  Spotlight. Added two file-based fallbacks:
+  - `~/.claude-bus/heartbeat-config/<name>.txt` — per-session integer
+    (minutes). Set this for the specific orchestrator you want to
+    self-pace.
+  - `~/.claude-bus/heartbeat-config/_default.txt` — machine-wide
+    default. Applies to every session that lacks a per-session file.
+
+  Resolution order: env > per-session file > default file > off.
+
+  Same pattern as `auto-spawn.on` and `notify.on` from earlier
+  versions — env for terminal flow, file for GUI flow.
+
 ## [0.12.0] — 2026-05-07
 
 Heartbeat prompt — proactive self-evaluation tick for orchestrators.
