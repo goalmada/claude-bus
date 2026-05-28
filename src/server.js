@@ -998,9 +998,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         "-p", prompt,
       ];
 
+      // Headless `claude -p` authenticates via CLAUDE_CODE_OAUTH_TOKEN
+      // (subscription) or a real ANTHROPIC_API_KEY. The Claude Code app
+      // injects its OWN ANTHROPIC_API_KEY into process.env; that value is
+      // not a valid standalone CLI key and it SHADOWS the OAuth token,
+      // causing every headless worker to die with "Invalid API key".
+      // Scrub it so the inherited CLAUDE_CODE_OAUTH_TOKEN takes effect.
+      const childEnv = { ...process.env, CLAUDE_BUS_NAME: workerName };
+      delete childEnv.ANTHROPIC_API_KEY;
       const child = childSpawn("claude", claudeArgs, {
         cwd,
-        env: { ...process.env, CLAUDE_BUS_NAME: workerName },
+        env: childEnv,
         stdio: ["ignore", logFd, logFd],
         detached: true,
       });
