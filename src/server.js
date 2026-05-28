@@ -14,7 +14,7 @@ import {
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn as childSpawn } from "node:child_process";
+import { spawn as childSpawn, execSync } from "node:child_process";
 
 import {
   appendMessage,
@@ -1006,6 +1006,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Scrub it so the inherited CLAUDE_CODE_OAUTH_TOKEN takes effect.
       const childEnv = { ...process.env, CLAUDE_BUS_NAME: workerName };
       delete childEnv.ANTHROPIC_API_KEY;
+      // The Claude Code app does not reliably propagate
+      // CLAUDE_CODE_OAUTH_TOKEN into this server's process.env (GUI-launched
+      // apps don't always inherit launchd GUI-session env). If it's missing,
+      // pull it from the launchd GUI session where `launchctl setenv` put it.
+      // No secret in source — read at runtime.
+      if (!childEnv.CLAUDE_CODE_OAUTH_TOKEN) {
+        try {
+          const tok = execSync("launchctl getenv CLAUDE_CODE_OAUTH_TOKEN", {
+            encoding: "utf8",
+          }).trim();
+          if (tok) childEnv.CLAUDE_CODE_OAUTH_TOKEN = tok;
+        } catch {}
+      }
       const child = childSpawn("claude", claudeArgs, {
         cwd,
         env: childEnv,
