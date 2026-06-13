@@ -153,14 +153,15 @@ scan_for_nudges() {
     const now = Date.now();
     const out = [];
 
-    // 1. Overdue tasks owned by this session.
+    // 1. Overdue tasks where this session is a report_to recipient.
     const tasksDir = path.join(root, "tasks");
     try {
       for (const f of fs.readdirSync(tasksDir)) {
         if (!f.endsWith(".json")) continue;
         try {
           const t = JSON.parse(fs.readFileSync(path.join(tasksDir, f), "utf8"));
-          if (t.owner !== me) continue;
+          const recipients = Array.isArray(t.report_to) ? t.report_to : [t.owner];
+          if (!recipients.includes(me)) continue;
           if (t.status === "reported" || t.status === "archived") continue;
           if (t.nudged_at) continue;
           if (!t.check_in_at) continue;

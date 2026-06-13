@@ -736,7 +736,7 @@ export async function listSentBy(senderName) {
 // check-in deadline without being reported. One nudge per task — once
 // nudged_at is set, future scans skip it.
 
-export async function findOverdueTasks(owner, nowMs = Date.now()) {
+export async function findOverdueTasks(recipient, nowMs = Date.now()) {
   let entries = [];
   try {
     entries = await fs.readdir(TASKS_DIR);
@@ -750,7 +750,8 @@ export async function findOverdueTasks(owner, nowMs = Date.now()) {
     try {
       const raw = await fs.readFile(path.join(TASKS_DIR, f), "utf8");
       const t = JSON.parse(raw);
-      if (t.owner !== owner) continue;
+      const reportTo = Array.isArray(t.report_to) ? t.report_to : [t.owner];
+      if (!reportTo.includes(recipient)) continue;
       if (t.status === "reported" || t.status === "archived") continue;
       if (t.nudged_at) continue;
       if (!t.check_in_at) continue;
