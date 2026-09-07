@@ -6,7 +6,7 @@ import { nativeClaude } from '../src/personal/claude.js';
 const [action, id] = process.argv.slice(2);
 try {
   const queue = new PersonalQueue();
-  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify'].includes(action) && !id) throw new Error('Task id required');
+  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume'].includes(action) && !id) throw new Error('Task id required');
   let result;
   const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
   switch (action) {
@@ -17,6 +17,8 @@ try {
       result = { id: taskId, status, launchId, resultHash, reason }; break;
     }
     case 'run': result = await queue.run(id, nativeClaude(queue.root)); break;
+    case 'pause': result = queue.pause(id); break;
+    case 'resume': result = queue.resume(id); break;
     case 'cancel': result = queue.cancel(id); break;
     case 'reconcile': result = queue.reconcile(id); break;
     case 'resolve': result = queue.resolveUncertain(id, input().evidence); break;

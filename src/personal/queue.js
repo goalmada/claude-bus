@@ -4,6 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { execFileSync, spawn } from 'node:child_process';
+import { validateScope, checkpoint, assertDiffScope } from './workspace.js';
 
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const inflight = new Set(['launching', 'running', 'uncertain']);
@@ -31,7 +32,15 @@ export class PersonalQueue {
       const state = fs.existsSync(this.file) ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : { version: 1, jobs: [] };
       if (state.version !== 1 || !Array.isArray(state.jobs)) throw new Error('Unsupported queue format');
       const before = JSON.stringify(state);
+      const previous = new Map(state.jobs.map(j => [j.id, JSON.stringify(j)]));
       const result = fn(state);
+      for (const job of state.jobs) {
+        if (previous.get(job.id) !== JSON.stringify(job)) {
+          job.revision = (job.revision ?? 0) + 1;
+          job.events ??= [];
+          job.events.push({ revision: job.revision, at: new Date().toISOString(), status: job.status, launchId: job.launchId ?? null });
+        }
+      }
       if (fs.existsSync(this.file) && JSON.stringify(state) === before) return structuredClone(result);
       const tmp = path.join(this.root, `queue-${crypto.randomUUID()}.tmp`);
       const fd = fs.openSync(tmp, 'wx', 0o600);
@@ -44,7 +53,7 @@ export class PersonalQueue {
     } finally { fs.rmSync(this.lock, { recursive: true }); }
   }
 
-  submit({ key, sourceTask, worktree, baseSha, brief, timeoutMs = 300000 }) {
+  submit({ key, sourceTask, worktree, baseSha, brief, timeoutMs = 300000, mode = 'review', scope, owner = sourceTask }) {
     if (![key, sourceTask, worktree, baseSha, brief].every(v => typeof v === 'string' && v.length)) throw new Error('Missing task fields');
     if (Buffer.byteLength(brief) > 128 * 1024 || key.length > 200 || sourceTask.length > 200) throw new Error('Task too large');
     if (!Number.isInteger(timeoutMs) || timeoutMs < 25 || timeoutMs > 600000) throw new Error('Timeout must be 25..600000 ms');
@@ -55,7 +64,9 @@ export class PersonalQueue {
     if (fs.realpathSync(gitDir) === common) throw new Error('Use an isolated linked worktree, not the primary checkout');
     if (!/^[a-f0-9]{40,64}$/.test(baseSha) || git(worktree, 'rev-parse', 'HEAD') !== baseSha) throw new Error('Base commit mismatch');
     if (git(worktree, 'status', '--porcelain')) throw new Error('Worktree must be clean');
-    const input = { sourceTask, worktree, baseSha, brief, timeoutMs, billingMode: 'subscription_only', tools: [] };
+    if (!['review', 'project'].includes(mode) || typeof owner !== 'string' || !owner) throw new Error('Task mode and owner required');
+    scope = mode === 'project' ? validateScope(worktree, scope) : null;
+    const input = { sourceTask, owner, worktree, baseSha, brief, timeoutMs, mode, scope, billingMode: 'subscription_only', tools: mode === 'project' ? ['read_file','write_file','run_tests'] : [] };
     const inputHash = digest(JSON.stringify(input));
     return this.transaction(state => {
       const existing = state.jobs.find(job => job.key === key);
@@ -63,6 +74,7 @@ export class PersonalQueue {
         if (existing.inputHash !== inputHash) throw new Error('Idempotency key already used for different input');
         return existing;
       }
+      if (state.jobs.some(j => j.worktree === worktree && !terminal.has(j.status))) throw new Error('Worktree already owned by an unfinished task');
       const job = { id: crypto.randomUUID(), key, ...input, inputHash, status: 'queued', createdAt: new Date().toISOString() };
       state.jobs.push(job);
       return job;
@@ -83,6 +95,23 @@ export class PersonalQueue {
       if (job.status === 'uncertain') throw new Error('Uncertain launch: reconcile the owned process manually before cancellation');
       if (['queued', 'blocked', 'reported'].includes(job.status)) job.status = 'cancelled';
       else job.cancelRequested = true;
+    });
+  }
+
+  pause(id) {
+    return this.change(id, job => {
+      if (job.status !== 'running') throw new Error('Only a running task can be interrupted');
+      job.pauseRequested = true;
+    });
+  }
+
+  resume(id) {
+    return this.change(id, job => {
+      if (!['paused', 'timed_out', 'blocked'].includes(job.status) || job.mode !== 'project' || !job.checkpoint) throw new Error('Resume requires a stopped project attempt with a checkpoint');
+      assertDiffScope(job.worktree, job.scope);
+      if (checkpoint(job.worktree, job.scope).hash !== job.checkpoint.hash) throw new Error('Checkpoint has external edits; inspect before continuing');
+      job.status = 'queued';
+      job.cancelRequested = false; job.pauseRequested = false;
     });
   }
 
@@ -107,7 +136,11 @@ export class PersonalQueue {
     if (!reviewer || !evidence || evidence.length < 20) throw new Error('Independent reviewer and verification evidence required');
     return this.change(id, job => {
       if (job.status !== 'reported' || job.resultHash !== resultHash) throw new Error('Verification must match a reported result');
-      if (git(job.worktree, 'rev-parse', 'HEAD') !== job.baseSha || git(job.worktree, 'status', '--porcelain')) throw new Error('Worktree changed since review');
+      if (git(job.worktree, 'rev-parse', 'HEAD') !== job.baseSha) throw new Error('Base changed since execution');
+      if (job.mode === 'project') {
+        assertDiffScope(job.worktree, job.scope);
+        if (checkpoint(job.worktree, job.scope).hash !== job.checkpoint?.hash) throw new Error('Edits changed since report');
+      } else if (git(job.worktree, 'status', '--porcelain')) throw new Error('Worktree changed since review');
       job.verification = { reviewer, evidence, resultHash, at: new Date().toISOString() };
       job.status = 'verified';
     });
@@ -119,6 +152,10 @@ export class PersonalQueue {
       const job = this.find(state, id);
       if (job.status !== 'queued') throw new Error('Only queued tasks can launch; never retry an uncertain launch');
       if (state.jobs.some(j => inflight.has(j.status))) throw new Error('One executor at a time; reconcile unfinished launches first');
+      job.attempts ??= [];
+      if (job.launchId) job.attempts.push({ launchId: job.launchId, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });
+      job.cancelRequested = false; job.pauseRequested = false;
+      delete job.result; delete job.resultHash;
       job.status = 'launching';
       job.launchId = launchId;
       job.startedAt = new Date().toISOString();
@@ -126,7 +163,11 @@ export class PersonalQueue {
     });
     let spec;
     try {
-      if (git(job.worktree, 'rev-parse', 'HEAD') !== job.baseSha || git(job.worktree, 'status', '--porcelain')) throw new Error('Worktree changed before launch');
+      if (git(job.worktree, 'rev-parse', 'HEAD') !== job.baseSha) throw new Error('Base changed before launch');
+      if (job.mode === 'project' && job.checkpoint) {
+        assertDiffScope(job.worktree, job.scope);
+        if (checkpoint(job.worktree, job.scope).hash !== job.checkpoint.hash) throw new Error('Checkpoint changed before resume');
+      } else if (git(job.worktree, 'status', '--porcelain')) throw new Error('Worktree changed before launch');
       spec = await executor.prepare(job);
     } catch {
       return this.change(id, j => { if (j.status === 'launching') { j.status = j.cancelRequested ? 'cancelled' : 'blocked'; j.reason = 'Preflight denied. Verify native account and configuration before submitting a new task.'; } });
@@ -159,7 +200,7 @@ export class PersonalQueue {
           this.change(id, j => { if (j.status !== 'launching') throw new Error('Launch was reconciled externally'); j.status = 'running'; j.pid = child.pid; });
           timer = setTimeout(() => stop('timed_out'), job.timeoutMs);
           poll = setInterval(() => {
-            try { const current = this.get(id); if (current.cancelRequested || current.status === 'uncertain') stop('cancelled'); }
+            try { const current = this.get(id); if (current.cancelRequested || current.status === 'uncertain') stop('cancelled'); else if (current.pauseRequested) stop('paused'); }
             catch { stop('uncertain'); }
           }, 50);
         } catch { stop('uncertain'); }
@@ -192,6 +233,10 @@ export class PersonalQueue {
         if (stopping) signal('SIGKILL');
         try {
           resolve(this.change(id, j => {
+            if (j.mode === 'project') {
+              try { assertDiffScope(j.worktree, j.scope); j.checkpoint = checkpoint(j.worktree, j.scope); }
+              catch { j.status = 'uncertain'; j.reason = 'Workspace changed outside scope; preserve edits and inspect'; }
+            }
             if (j.status === 'uncertain') return;
             j.exitCode = code; j.exitSignal = sig; j.eventCount = count; j.finishedAt = new Date().toISOString();
             if (signalDenied) { j.status = 'uncertain'; j.reason = 'Owned process group termination could not be confirmed'; return; }
@@ -205,7 +250,7 @@ export class PersonalQueue {
           }));
         } catch (error) { reject(error); }
       });
-      child.stdin.end(job.brief);
+      child.stdin.end(job.brief + (job.checkpoint ? '\nContinuation: preserved files already contain earlier work. Read before editing; finish remaining work without restarting or discarding edits.' : ''));
     });
   }
 }

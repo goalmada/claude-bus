@@ -41,7 +41,10 @@ test('idempotency survives reopening; conflicting input is rejected', t => {
 
 test('one executor lease blocks duplicates and other jobs until reconciled', async t => {
   const { queue, input } = fixture(t);
-  const a = queue.submit(input), b = queue.submit({ ...input, key: 'two' });
+  const a = queue.submit(input);
+  const other = path.join(path.dirname(input.worktree), 'other');
+  execFileSync('git', ['-C', input.worktree, 'worktree', 'add', '--detach', other, 'HEAD'], { stdio: 'ignore' });
+  const b = queue.submit({ ...input, key: 'two', worktree: other });
   const work = queue.run(a.id, fake('setInterval(()=>{}, 1000)'));
   await running(queue, a.id);
   await assert.rejects(queue.run(a.id, fake()), /Only queued/);
@@ -87,13 +90,13 @@ test('reported is not verified; reviewer must bind evidence to exact result', as
 });
 
 test('denial or malformed stream cannot count as a successful report', async t => {
-  const { queue, input } = fixture(t);
   for (const [key, script, expected] of [
     ['denied', `console.log(JSON.stringify({type:'result',subtype:'success',result:'x',permission_denials:[{}]}))`, 'blocked'],
     ['invalid', `console.log('not-json')`, 'failed'],
     ['missing', `console.log(JSON.stringify({type:'system'}))`, 'failed'],
     ['nonzero', `${success};process.exitCode=1`, 'failed'],
   ]) {
+    const { queue, input } = fixture(t);
     const job = queue.submit({ ...input, key });
     assert.equal((await queue.run(job.id, fake(script))).status, expected);
   }
@@ -185,4 +188,31 @@ test('a real supervisor crash preserves launch uncertainty across processes', as
   assert.equal(reopened.get(job.id).status, 'launching');
   assert.equal(reopened.reconcile(job.id).status, 'uncertain');
   await assert.rejects(reopened.run(job.id, fake()), /Only queued/);
+});
+
+test('project pause preserves edits and resumes same task with a new attempt', async t => {
+  const {queue,input}=fixture(t);
+  const job=queue.submit({...input,mode:'project',scope:{read:[],edit:['source.js'],tests:['test/unit.test.js']}});
+  const pending=queue.run(job.id,fake(`require('node:fs').writeFileSync('source.js','preserved'); setInterval(()=>{},1000)`));
+  await running(queue,job.id);
+  while(!fs.existsSync(path.join(input.worktree,'source.js'))) await new Promise(r=>setTimeout(r,10));
+  queue.pause(job.id);
+  const paused=await pending;
+  assert.equal(paused.status,'paused'); assert.equal(paused.checkpoint.files['source.js'],'preserved');
+  assert.equal(queue.resume(job.id).status,'queued');
+  const report=await queue.run(job.id,fake(success));
+  assert.equal(report.status,'reported');assert.equal(report.attempts.length,1);
+  assert.equal(fs.readFileSync(path.join(input.worktree,'source.js'),'utf8'),'preserved');
+  assert.ok(report.events.some(e=>e.status==='paused'));
+  assert.ok(report.events.every((e,i)=>i===0 || e.revision>report.events[i-1].revision));
+  queue.verify(job.id,{reviewer:'independent',resultHash:report.resultHash,evidence:'Compared preserved content with the assigned source fixture.'});
+});
+
+test('project recovery refuses changed checkpoints and out-of-scope output', async t => {
+  const {queue,input}=fixture(t);
+  const job=queue.submit({...input,mode:'project',scope:{read:[],edit:['source.js'],tests:['test/unit.test.js']}});
+  const result=await queue.run(job.id,fake(`require('node:fs').writeFileSync('outside.js','bad');${success}`));
+  assert.equal(result.status,'uncertain');
+  assert.throws(()=>queue.resume(job.id),/stopped/);
+  assert.equal(queue.get(job.id).events.at(-1).status,'uncertain');
 });
