@@ -35,3 +35,25 @@ test('deadline never interrupts an occupied slot belonging to another worker',as
  const result=await workQueue(queue,{}, {maxRunMs:100,pollMs:25});
  assert.equal(result.state,'deadline');assert.equal(result.launched,0);
 });
+
+test('waiting at deadline retains review reason and task identity',async()=>{
+ const result=await workQueue({get:()=>[]},{},{maxRunMs:100,pollMs:25,dispatch:async()=>({state:'waiting',reason:'review_required',taskId:'reported'})});
+ assert.equal(result.state,'deadline');assert.equal(result.lastOutcome.reason,'review_required');assert.equal(result.lastOutcome.taskId,'reported');
+});
+
+test('supervisor failure requests a stop for its claimed task',async()=>{
+ let paused=null;
+ const queue={get:id=>id?{status:'running'}:[],pause:id=>{paused=id;}};
+ await assert.rejects(workQueue(queue,{prepare:async()=>({})},{dispatch:async(q,executor)=>{
+  await executor.prepare({id:'owned'});throw new Error('supervisor failure');
+ }}),/supervisor failure/);
+ assert.equal(paused,'owned');
+});
+
+test('failed stop request is reported explicitly',async()=>{
+ const queue={get:id=>id?{status:'launching'}:[],cancel:()=>{throw new Error('locked');}};
+ const result=await workQueue(queue,{prepare:async()=>{await new Promise(r=>setTimeout(r,150));return {}; }},{maxRunMs:100,pollMs:25,dispatch:async(q,executor)=>{
+  await executor.prepare({id:'owned'});return {state:'cancelled',taskId:'owned'};
+ }});
+ assert.equal(result.state,'uncertain');assert.equal(result.reason,'stop_request_failed');assert.equal(result.taskId,'owned');
+});
