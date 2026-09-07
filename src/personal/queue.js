@@ -63,7 +63,7 @@ export class PersonalQueue {
     const common = fs.realpathSync(path.resolve(worktree, git(worktree, 'rev-parse', '--git-common-dir')));
     if (fs.realpathSync(gitDir) === common) throw new Error('Use an isolated linked worktree, not the primary checkout');
     if (!/^[a-f0-9]{40,64}$/.test(baseSha) || git(worktree, 'rev-parse', 'HEAD') !== baseSha) throw new Error('Base commit mismatch');
-    if (git(worktree, 'status', '--porcelain')) throw new Error('Worktree must be clean');
+
     if (!['review', 'project'].includes(mode) || typeof owner !== 'string' || !owner) throw new Error('Task mode and owner required');
     scope = mode === 'project' ? validateScope(worktree, scope) : null;
     const input = { sourceTask, owner, worktree, baseSha, brief, timeoutMs, mode, scope, billingMode: 'subscription_only', tools: mode === 'project' ? ['read_file','write_file','run_tests'] : [] };
@@ -74,6 +74,7 @@ export class PersonalQueue {
         if (existing.inputHash !== inputHash) throw new Error('Idempotency key already used for different input');
         return existing;
       }
+      if (git(worktree, 'status', '--porcelain')) throw new Error('Worktree must be clean');
       if (state.jobs.some(j => j.worktree === worktree && !terminal.has(j.status))) throw new Error('Worktree already owned by an unfinished task');
       const job = { id: crypto.randomUUID(), key, ...input, inputHash, status: 'queued', createdAt: new Date().toISOString() };
       state.jobs.push(job);
@@ -81,7 +82,12 @@ export class PersonalQueue {
     });
   }
 
-  get(id) { return this.transaction(state => id ? this.find(state, id) : state.jobs); }
+  get(id) {
+    // Atomic replacement gives readers a complete snapshot without contending with a writer.
+    const state = fs.existsSync(this.file) ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : { version: 1, jobs: [] };
+    if (state.version !== 1 || !Array.isArray(state.jobs)) throw new Error('Unsupported queue format');
+    return structuredClone(id ? this.find(state, id) : state.jobs);
+  }
   find(state, id) {
     const job = state.jobs.find(j => j.id === id);
     if (!job) throw new Error('Unknown task');
@@ -107,7 +113,7 @@ export class PersonalQueue {
 
   resume(id) {
     return this.change(id, job => {
-      if (!['paused', 'timed_out', 'blocked'].includes(job.status) || job.mode !== 'project' || !job.checkpoint) throw new Error('Resume requires a stopped project attempt with a checkpoint');
+      if ((!['paused', 'timed_out', 'blocked'].includes(job.status) && !(job.status === 'failed' && job.reconciliationEvidence)) || job.mode !== 'project' || !job.checkpoint) throw new Error('Resume requires a stopped project attempt with a checkpoint');
       assertDiffScope(job.worktree, job.scope);
       if (checkpoint(job.worktree, job.scope).hash !== job.checkpoint.hash) throw new Error('Checkpoint has external edits; inspect before continuing');
       job.status = 'queued';
@@ -155,7 +161,7 @@ export class PersonalQueue {
       job.attempts ??= [];
       if (job.launchId) job.attempts.push({ launchId: job.launchId, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });
       job.cancelRequested = false; job.pauseRequested = false;
-      delete job.result; delete job.resultHash;
+      delete job.result; delete job.resultHash; delete job.runtime; delete job.reason; delete job.sessionId;
       job.status = 'launching';
       job.launchId = launchId;
       job.startedAt = new Date().toISOString();
@@ -187,7 +193,7 @@ export class PersonalQueue {
     };
     let stopping = null, escalation, poll, timer, bytes = 0, pending = '', result = null, count = 0;
     const decoder = new StringDecoder('utf8');
-    let protocolError = false, spawnError = false;
+    let protocolError = false, spawnError = false, initConfirmed = false;
     const stop = reason => {
       if (stopping) return;
       stopping = reason;
@@ -217,6 +223,11 @@ export class PersonalQueue {
           if (!line.trim()) continue;
           try {
             const event = JSON.parse(line); count++;
+            if (event.type === 'system' && event.subtype === 'init') {
+              this.change(id, j => { j.sessionId = event.session_id ?? null; j.runtime = { tools: event.tools ?? [], mcpServers: event.mcp_servers ?? [], sessionId: event.session_id ?? null }; });
+              if (spec.expectedTools?.length && (spec.expectedTools.some(tool => !event.tools?.includes(tool)) || event.tools?.some(tool => !spec.expectedTools.includes(tool)))) stop('blocked');
+              else initConfirmed = true;
+            }
             // Only final result is retained. Tool output, stderr and auth data stay out of logs.
             if (event.type === 'result') {
               if (result) throw new Error('Duplicate final result');
@@ -240,9 +251,10 @@ export class PersonalQueue {
             if (j.status === 'uncertain') return;
             j.exitCode = code; j.exitSignal = sig; j.eventCount = count; j.finishedAt = new Date().toISOString();
             if (signalDenied) { j.status = 'uncertain'; j.reason = 'Owned process group termination could not be confirmed'; return; }
-            if (stopping) { j.status = stopping; return; }
+            if (stopping) { j.status = stopping; j.reason = stopping === 'uncertain' ? 'Supervisor state synchronization failed; inspect the owned process group' : 'Execution stopped by supervisor'; return; }
             if (j.cancelRequested) { j.status = 'cancelled'; return; }
             if (spawnError || code !== 0 || protocolError || pending.trim() || !result) { j.status = 'failed'; j.reason = 'Executor failed or returned incomplete structured output'; return; }
+            if (spec.expectedTools?.length && !initConfirmed) { j.status = 'blocked'; j.reason = 'Required tools were not confirmed by runtime initialization'; return; }
             if (result.is_error || result.subtype !== 'success' || typeof result.result !== 'string' || result.permission_denials?.length) {
               j.status = 'blocked'; j.reason = 'Executor reported an error or denied permission; no fallback'; return;
             }

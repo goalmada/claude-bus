@@ -23,11 +23,11 @@ export function nativeClaude(root, inspect = (args, env) => JSON.parse(execFileS
       for (const key of ['HOME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'USER', 'LOGNAME', 'SHELL']) {
         if (process.env[key]) env[key] = process.env[key];
       }
-      const settings = JSON.stringify({ forceLoginMethod: 'claudeai', forceLoginOrgUUID: gate.organizationId });
+      const settings = JSON.stringify({ forceLoginMethod: 'claudeai', forceLoginOrgUUID: gate.organizationId, disableAllHooks: true });
       const base = ['--safe-mode', '--restricted', '--settings', settings];
       const status = inspect([...base, 'auth', 'status'], env);
       // Fail closed on unknown future auth schemas. These are native stored-login labels.
-      if (!status.loggedIn || !['claude.ai', 'claudeAi', 'oauth'].includes(status.authMethod) || status.apiProvider !== 'firstParty') {
+      if (!status.loggedIn || !['claude.ai', 'claudeAi', 'oauth'].includes(status.authMethod) || status.apiProvider !== 'firstParty' || status.subscriptionType !== 'max' || status.orgId !== gate.organizationId) {
         throw new Error('Native subscription login is unavailable or unrecognized');
       }
       let mcp = { mcpServers: {} };
@@ -39,9 +39,11 @@ export function nativeClaude(root, inspect = (args, env) => JSON.parse(execFileS
         mcp.mcpServers.project = { command: process.execPath, args: [fileURLToPath(new URL('./project-mcp.js', import.meta.url)), configPath] };
         toolArgs.push('--allowedTools', 'mcp__project__read_file,mcp__project__write_file,mcp__project__run_tests');
       }
+      const launchBase = job.mode === 'project' ? ['--restricted', '--setting-sources', '', '--disable-slash-commands', '--settings', settings] : base;
       return {
         command: 'claude', env,
-        args: [...base, '--tools', '', '--strict-mcp-config', '--mcp-config', JSON.stringify(mcp), ...toolArgs,
+        expectedTools: job.mode === 'project' ? ['mcp__project__read_file','mcp__project__write_file','mcp__project__run_tests'] : [],
+        args: [...launchBase, '--tools', '', '--strict-mcp-config', '--mcp-config', JSON.stringify(mcp), ...toolArgs,
           '--permission-mode', 'dontAsk', '--no-session-persistence', '--no-chrome',
           '-p', '--output-format', 'stream-json', '--verbose'],
       };

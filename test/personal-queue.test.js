@@ -134,7 +134,7 @@ test('native preflight strips billing overrides and rejects API auth without lau
   };
   await assert.rejects(nativeClaude(queue.root, inspected).prepare(), /subscription login/);
   assert.ok(checked);
-  const spec = await nativeClaude(queue.root, () => ({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' })).prepare();
+  const spec = await nativeClaude(queue.root, () => ({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max', orgId: '00000000-0000-0000-0000-000000000000' })).prepare();
   assert.equal(spec.args[spec.args.indexOf('--tools') + 1], '');
   assert.ok(spec.args.includes('dontAsk'));
   assert.ok(!spec.args.includes('--bare'));
@@ -163,7 +163,8 @@ test('reconciliation during preflight prevents spawning', async t => {
 test('stale transaction lock fails closed and is not stolen', t => {
   const { queue } = fixture(t);
   fs.mkdirSync(queue.lock, { mode: 0o700 });
-  assert.throws(() => queue.get(), /Queue locked/);
+  assert.throws(() => queue.transaction(() => null), /Queue locked/);
+  assert.deepEqual(queue.get(), []);
   assert.ok(fs.existsSync(queue.lock));
 });
 
@@ -215,4 +216,11 @@ test('project recovery refuses changed checkpoints and out-of-scope output', asy
   assert.equal(result.status,'uncertain');
   assert.throws(()=>queue.resume(job.id),/stopped/);
   assert.equal(queue.get(job.id).events.at(-1).status,'uncertain');
+});
+
+test('required project tools must be confirmed by actual runtime initialization', async t => {
+  const {queue,input}=fixture(t);const job=queue.submit(input);
+  const executor=fake(success);const prepare=executor.prepare;
+  executor.prepare=async()=>({...await prepare(),expectedTools:['mcp__project__write_file']});
+  assert.equal((await queue.run(job.id,executor)).status,'blocked');
 });
