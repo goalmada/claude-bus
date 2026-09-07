@@ -7,7 +7,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { validateScope, checkpoint, assertDiffScope } from './workspace.js';
 
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
-const inflight = new Set(['launching', 'running', 'uncertain']);
+const inflight = new Set(['launching', 'running', 'uncertain', 'checking']);
 const terminal = new Set(['verified', 'failed', 'cancelled', 'timed_out']);
 const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 
@@ -141,6 +141,7 @@ export class PersonalQueue {
   verify(id, { reviewer, resultHash, evidence }) {
     if (!reviewer || !evidence || evidence.length < 20) throw new Error('Independent reviewer and verification evidence required');
     return this.change(id, job => {
+      if (job.checkApproval && (job.checkResult?.code !== 0 || job.checkResult?.checkpointHash !== job.checkpoint?.hash)) throw new Error('Approved project check must pass for the current edits');
       if (job.status !== 'reported' || job.resultHash !== resultHash) throw new Error('Verification must match a reported result');
       if (git(job.worktree, 'rev-parse', 'HEAD') !== job.baseSha) throw new Error('Base changed since execution');
       if (job.mode === 'project') {

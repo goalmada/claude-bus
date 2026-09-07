@@ -1,0 +1,31 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {execFileSync} from 'node:child_process';
+import {PersonalQueue} from '../src/personal/queue.js';
+import {approveCheck,runApprovedCheck} from '../src/personal/checks.js';
+
+test('reviewed npm recipe executes real child processes; stale approval and arbitrary commands fail', {skip:process.platform!=='darwin'}, async t=>{
+ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'approved-npm-test-')));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const repo=path.join(root,'repo');fs.mkdirSync(repo);fs.mkdirSync(path.join(repo,'test'));
+ fs.writeFileSync(path.join(repo,'package.json'),JSON.stringify({name:'fixture',version:'1.0.0',scripts:{test:'node test/check.test.js'}}));
+ fs.writeFileSync(path.join(repo,'source.js'),'module.exports=2;');
+ fs.writeFileSync(path.join(repo,'test/check.test.js'),"require('node:assert/strict').equal(require('../source.js'),2); console.log('real npm child passed');");
+ const git=(...args)=>execFileSync('git',['-C',repo,...args],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
+ git('init');git('add','.');git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','Fixture');
+ const worktree=path.join(root,'worktree');git('worktree','add','--detach',worktree,'HEAD');
+ const q=new PersonalQueue(path.join(root,'private'));
+ const j=q.submit({key:'recipe',sourceTask:'fixture',worktree,baseSha:git('rev-parse','HEAD'),brief:'fixture',mode:'project',scope:{read:[],edit:['source.js'],tests:['test/check.test.js']}});
+ await assert.rejects(runApprovedCheck(q,j.id),/approval/);
+ await q.run(j.id,{prepare:async()=>({command:process.execPath,args:['-e',`console.log(JSON.stringify({type:'result',subtype:'success',result:'fixture'}))`],env:{}})});
+ assert.throws(()=>approveCheck(q,j.id,{recipe:'shell',reviewer:'test',evidence:'Reviewed fixture files and test script.'}),/Known recipe/);
+ approveCheck(q,j.id,{recipe:'npm-test',reviewer:'test',evidence:'Reviewed fixture files and exact npm test script.'});
+ const result=await runApprovedCheck(q,j.id);
+ const output=fs.readFileSync(path.join(q.root,j.id+'-approved-check.txt'),'utf8');
+ assert.equal(result.checkResult.code,0,output);assert.match(output,/real npm child passed/);
+ assert.equal(result.status,'reported');
+ fs.writeFileSync(path.join(worktree,'source.js'),'changed');
+ await assert.rejects(runApprovedCheck(q,j.id),/changed/);
+});

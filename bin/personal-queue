@@ -2,15 +2,18 @@
 import fs from 'node:fs';
 import { PersonalQueue } from '../src/personal/queue.js';
 import { dashboardHandoff } from '../src/personal/projection.js';
+import { approveCheck, runApprovedCheck } from '../src/personal/checks.js';
 import { nativeClaude } from '../src/personal/claude.js';
 
 const [action, id] = process.argv.slice(2);
 try {
   const queue = new PersonalQueue();
-  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume', 'handoff'].includes(action) && !id) throw new Error('Task id required');
+  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume', 'handoff', 'approve-check', 'check'].includes(action) && !id) throw new Error('Task id required');
   let result;
   const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
   switch (action) {
+    case 'approve-check': result = approveCheck(queue, id, input()); break;
+    case 'check': result = await runApprovedCheck(queue, id); break;
     case 'handoff': console.log(JSON.stringify(dashboardHandoff(queue.get(id), input()), null, 2)); process.exit(0); break;
     case 'submit': result = queue.submit(input()); break;
     case 'list': result = queue.get().map(({ id, status, createdAt }) => ({ id, status, createdAt })); break;
