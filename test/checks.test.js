@@ -26,6 +26,16 @@ test('reviewed npm recipe executes real child processes; stale approval and arbi
  const output=fs.readFileSync(path.join(q.root,j.id+'-approved-check.txt'),'utf8');
  assert.equal(result.checkResult.code,0,output);assert.match(output,/real npm child passed/);
  assert.equal(result.status,'reported');
+ // A failed sandbox run remains visible even when a coordinator checks separately.
+ q.change(j.id,job=>{job.checkResult.code=1;});
+ const verify={reviewer:'coordinator',resultHash:result.resultHash,evidence:'Independently reviewed exact fixture and retained check output.'};
+ assert.throws(()=>q.verify(j.id,verify),/must pass/);
+ assert.throws(()=>q.verify(j.id,{...verify,independentCheck:{code:0,checkpointHash:'stale',outputHash:'a'.repeat(64),evidence:verify.evidence}}),/must pass/);
  fs.writeFileSync(path.join(worktree,'source.js'),'changed');
  await assert.rejects(runApprovedCheck(q,j.id),/changed/);
+ fs.writeFileSync(path.join(worktree,'source.js'),'module.exports=2;');
+ const verified=q.verify(j.id,{...verify,independentCheck:{code:0,checkpointHash:result.checkpoint.hash,outputHash:result.checkResult.outputHash,evidence:verify.evidence}});
+ assert.equal(verified.status,'verified');
+ assert.equal(verified.checkResult.code,1);
+ assert.equal(verified.verification.independentCheck.mechanism,'coordinator_attestation');
 });

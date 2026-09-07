@@ -1,10 +1,10 @@
-# Personal subscription queue (opt-in preparation)
+# Personal subscription queue (opt-in execution)
 
-This separate command prepares bounded local review jobs for the official Claude Code CLI. It does not modify the existing bus server, hooks, terminal workers, or dashboard. There is no daemon, automatic queue drain, model call on installation, or fallback executor. Real launches are disabled by default. Review mode is tool-free. Project mode edits exact assigned files and runs fixed sandboxed Node tests.
+This separate command prepares bounded local review jobs for the official Claude Code CLI. It does not modify the existing bus server, hooks, terminal workers, or dashboard. There is no installed daemon, model call on installation, or fallback executor. An explicitly started bounded worker can select queued tasks. Real launches are disabled by default. Review mode is tool-free. Project mode edits exact assigned files and runs fixed sandboxed Node tests.
 
 ## Decision and limits
 
-A structured subprocess was selected over terminal screen detection. Final JSON and process exit status can distinguish failure from a report without guessing from an idle terminal. The existing bus executor is left alone because changing its defaults would affect current users. This module uses no external packages.
+A structured subprocess was selected over terminal screen detection. Final JSON and process exit status can distinguish failure from a report without guessing from an idle terminal. The existing bus executor is left alone because changing its defaults would affect current users. The queue uses Node built-ins; project tools reuse the repository MCP SDK.
 
 The public repository contains generic code, synthetic tests, and this design. Never commit real task descriptions, results, account identifiers, verification records, or credentials here. State belongs under `~/.local/state/claude-personal-queue`, outside any Git checkout, owned by the current user with mode 0700. State files use mode 0600 and atomic, synced replacement. Existing overly permissive directories are rejected rather than silently changed.
 
@@ -58,7 +58,7 @@ npm run test:personal
 
 Tests use temporary Git repositories and Node fake executors only. They exercise deduplication, single-executor admission, cancellation, forced timeout termination, persisted uncertain launch intent, preflight reconciliation, malformed/error output, reviewer-bound verification, private state permissions, native auth rejection and default-disabled behavior. No Claude model call is part of testing.
 
-Rollback: stop new submissions, cancel only adapter-owned work, inspect any uncertain launch, and remove the private verification file. Preserve private results and worktrees for review. Then stop using this branch or revert its commit. Existing bus and terminal workers continue unchanged. Broader test commands, automatic scheduling, remote hosting and machine-to-machine dashboard ingestion remain outside this implementation.
+Rollback: stop new submissions, cancel only adapter-owned work, inspect any uncertain launch, and remove the private verification file. Preserve private results and worktrees for review. Then stop using this branch or revert its commit. Existing bus and terminal workers continue unchanged. Remote hosting, launch-on-login scheduling and machine-to-machine dashboard ingestion remain outside this implementation.
 
 Validation note: the existing `mcp_roundtrip.js` suite intermittently reports three live-peer detection assertion failures. The same failures were reproduced from unchanged `origin/main`; this adapter is not imported by that server. Smoke and claim-flow checks passed, and a complete suite run also passed during preparation. Keep this pre-existing timing issue distinct from the isolated executor tests.
 
@@ -81,3 +81,19 @@ The private dashboard is a separate owner-controlled card projection. The bridge
 Generate an owner-reviewed dashboard handoff with `handoff <id>` and evidence JSON on stdin. The command returns only the explicit projection fields; it does not publish anything. Queue revisions and occurrence times remain attached. Send that result to the designated dashboard owner, who applies the projection and verifies the displayed card.
 
 Actual integration exercised native subscription project tools, two source writes, fixed sandboxed tests and independent review. An intentional interruption preserved the first edit; a conservatively uncertain attempt was reconciled after checking process absence and continued with the same task/worktree. Two integration defects were corrected: safe mode hid the explicit broker, and read-only state polling contended with the writer lock. Reads now consume atomically replaced snapshots. Private execution identities and evidence remain outside this public document.
+
+## Reviewed project commands
+
+The coordinator can use `approve-check <id>` with JSON containing `recipe`, `reviewer`, and concrete `evidence`, then `check <id>`. Supported recipes are `npm-test` and `npm-build`. Approval binds the unchanged base commit, scoped file checkpoint and exact package script. Build outputs can be explicitly limited to `dist`, `build`, or `.next`; tests cannot write project directories. Dependencies must already be installed. No package installation or network access is granted.
+
+The command runs under a separate macOS sandbox with selected child executables, private temporary writes, a two-minute limit and bounded output. Cancellation or timeout leaves an uncertain state for process reconciliation. A synthetic npm fixture demonstrated actual shell/Node subprocess execution. This repository's complete suite does **not** pass inside that profile: Git fixture creation and nested sandbox setup are blocked. No general project compatibility or real application build is claimed. This is a selected-command boundary, not a VM or a general shell for model-generated programs.
+
+The full repository suite passed when run independently by the coordinator outside the outer sandbox. When a project needs that separate review path, `verify` accepts an explicit `independentCheck` attestation with zero `code`, the exact `checkpointHash`, retained output's SHA-256 `outputHash`, and concrete `evidence`. It preserves the failed sandbox result and labels the separate record `coordinator_attestation`. The native executor cannot issue approvals or verification. An attestation is the coordinator's assertion backed by retained output, not a cryptographic proof or a successful sandbox run.
+
+## Dispatch and bounded work
+
+`dispatch` selects the oldest queued task once. An occupied or uncertain executor slot blocks selection; any reported result waits for coordinator review. Stopped tasks are never resumed automatically. `work` accepts JSON on stdin with optional `maxJobs` (1 to 20), `maxRunMs` (100 to 1800000), and `pollMs` (25 to 5000). Defaults are five launches and fifteen minutes. It polls for queued work and completed review, then exits at its bound. Interrupting it stops only the task it claimed. Authentication, quota and uncertain launch failures stop it without changing billing routes.
+
+The subscription gate must still be fresh for every launch. The worker never renews quota evidence, retrieves credentials or silently resumes paused tasks. `resume` remains an explicit coordinator action after checkpoint and process checks. No background service is installed by this command.
+
+Native subscription execution produced the dispatcher and its tests in an actual linked project worktree. Both the native tool and coordinator passed the assigned 33 tests. The coordinator also passed the repository suite independently before committing. Dispatcher ordering, stop handling and bounded worker behavior are tested with simulated queue/executor state; a sustained multi-job native queue drain has not been demonstrated. These are separate claims.

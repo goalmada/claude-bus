@@ -17,8 +17,8 @@
   ],
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/smoke.js && node test/mcp_roundtrip.js && node test/mcp_claim_flow.js && node --test test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js",
-    "test:personal": "node --test test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js"
+    "test": "node test/smoke.js && node test/mcp_roundtrip.js && node test/mcp_claim_flow.js && node --test test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js test/dispatcher.test.js test/worker.test.js",
+    "test:personal": "node --test test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js test/dispatcher.test.js test/worker.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

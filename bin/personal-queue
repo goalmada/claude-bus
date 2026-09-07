@@ -4,6 +4,8 @@ import { PersonalQueue } from '../src/personal/queue.js';
 import { dashboardHandoff } from '../src/personal/projection.js';
 import { approveCheck, runApprovedCheck } from '../src/personal/checks.js';
 import { nativeClaude } from '../src/personal/claude.js';
+import { dispatchNext } from '../src/personal/dispatcher.js';
+import { workQueue } from '../src/personal/worker.js';
 
 const [action, id] = process.argv.slice(2);
 try {
@@ -12,6 +14,15 @@ try {
   let result;
   const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
   switch (action) {
+    case 'dispatch': console.log(JSON.stringify(await dispatchNext(queue, nativeClaude(queue.root)))); process.exit(0); break;
+    case 'work': {
+      const controller = new AbortController();
+      const stop = () => controller.abort();
+      process.once('SIGINT', stop); process.once('SIGTERM', stop);
+      try { console.log(JSON.stringify(await workQueue(queue, nativeClaude(queue.root), { ...input(), signal: controller.signal, onEvent: event => console.error(JSON.stringify(event)) }))); }
+      finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+      process.exit(0); break;
+    }
     case 'approve-check': result = approveCheck(queue, id, input()); break;
     case 'check': result = await runApprovedCheck(queue, id); break;
     case 'handoff': console.log(JSON.stringify(dashboardHandoff(queue.get(id), input()), null, 2)); process.exit(0); break;
@@ -28,7 +39,7 @@ try {
     case 'reconcile': result = queue.reconcile(id); break;
     case 'resolve': result = queue.resolveUncertain(id, input().evidence); break;
     case 'verify': result = queue.verify(id, input()); break;
-    default: throw new Error('Usage: personal-queue submit|list|status|run|pause|resume|cancel|reconcile|resolve|verify|handoff [id]. Input JSON uses stdin. State and results stay in the private queue directory.');
+    default: throw new Error('Usage: personal-queue submit|list|status|run|dispatch|work|pause|resume|cancel|reconcile|resolve|verify|handoff|approve-check|check [id]. Input JSON uses stdin. State and results stay in the private queue directory.');
   }
   // Deliberately never print briefs, results, account details or verification evidence.
   console.log(JSON.stringify(Array.isArray(result) ? result : { id: result.id, status: result.status, revision: result.revision, owner: result.owner, sourceTask: result.sourceTask, launchId: result.launchId, resultHash: result.resultHash, reason: result.reason }, null, 2));
