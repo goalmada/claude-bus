@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import { PersonalQueue } from '../src/personal/queue.js';
+import { dashboardHandoff } from '../src/personal/projection.js';
 import { nativeClaude } from '../src/personal/claude.js';
 
 const [action, id] = process.argv.slice(2);
 try {
   const queue = new PersonalQueue();
-  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume'].includes(action) && !id) throw new Error('Task id required');
+  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume', 'handoff'].includes(action) && !id) throw new Error('Task id required');
   let result;
   const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
   switch (action) {
+    case 'handoff': console.log(JSON.stringify(dashboardHandoff(queue.get(id), input()), null, 2)); process.exit(0); break;
     case 'submit': result = queue.submit(input()); break;
     case 'list': result = queue.get().map(({ id, status, createdAt }) => ({ id, status, createdAt })); break;
     case 'status': {
-      const { id: taskId, status, launchId, resultHash, reason } = queue.get(id);
-      result = { id: taskId, status, launchId, resultHash, reason }; break;
+      const { id: taskId, status, revision, owner, sourceTask, launchId, resultHash, reason } = queue.get(id);
+      result = { id: taskId, status, revision, owner, sourceTask, launchId, resultHash, reason }; break;
     }
     case 'run': result = await queue.run(id, nativeClaude(queue.root)); break;
     case 'pause': result = queue.pause(id); break;
@@ -23,9 +25,9 @@ try {
     case 'reconcile': result = queue.reconcile(id); break;
     case 'resolve': result = queue.resolveUncertain(id, input().evidence); break;
     case 'verify': result = queue.verify(id, input()); break;
-    default: throw new Error('Usage: personal-queue submit|list|status|run|cancel|reconcile|resolve|verify [id]. Input JSON uses stdin. State and results stay in the private queue directory.');
+    default: throw new Error('Usage: personal-queue submit|list|status|run|pause|resume|cancel|reconcile|resolve|verify|handoff [id]. Input JSON uses stdin. State and results stay in the private queue directory.');
   }
   // Deliberately never print briefs, results, account details or verification evidence.
-  console.log(JSON.stringify(Array.isArray(result) ? result : { id: result.id, status: result.status, resultHash: result.resultHash, reason: result.reason }, null, 2));
+  console.log(JSON.stringify(Array.isArray(result) ? result : { id: result.id, status: result.status, revision: result.revision, owner: result.owner, sourceTask: result.sourceTask, launchId: result.launchId, resultHash: result.resultHash, reason: result.reason }, null, 2));
   if (result.status === 'blocked' || result.status === 'failed' || result.status === 'uncertain') process.exitCode = 2;
 } catch (error) { console.error(error instanceof SyntaxError ? 'Invalid JSON; inspect the private input or queue state' : error.message); process.exitCode = 1; }
