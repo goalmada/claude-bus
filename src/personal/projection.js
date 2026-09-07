@@ -10,6 +10,8 @@ const mapped = new Map([
   ['queued', 'todo'],
   ['launching', 'running'],
   ['running', 'running'],
+  // A check is still an owned in-flight attempt, so it reads as running on the dashboard.
+  ['checking', 'running'],
   ['blocked', 'blocked'],
   ['reported', 'waiting'],
   ['paused', 'waiting'],

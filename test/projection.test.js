@@ -76,6 +76,7 @@ test('maps every known state and preserves the exact state', () => {
     queued: 'todo',
     launching: 'running',
     running: 'running',
+    checking: 'running',
     blocked: 'blocked',
     reported: 'waiting',
     paused: 'waiting',
@@ -87,6 +88,21 @@ test('maps every known state and preserves the exact state', () => {
     assert.equal(handoff.suggestedStatus, suggestedStatus, `${status} should suggest ${suggestedStatus}`);
     assert.equal(handoff.state, status, `${status} must be reported verbatim`);
   }
+});
+
+test('checking is an owned in-flight attempt and reads as running', () => {
+  for (const kind of ['actual', 'simulated', 'unverified']) {
+    const handoff = dashboardHandoff(job({ status: 'checking' }), evidence({ kind }));
+    assert.equal(handoff.suggestedStatus, 'running', `checking must read as running for ${kind} evidence`);
+    assert.equal(handoff.state, 'checking', 'checking must be reported verbatim');
+    assert.deepEqual(Object.keys(handoff).sort(), [...fields].sort());
+  }
+  // A verification record cannot promote an in-flight check.
+  const verified = dashboardHandoff(
+    job({ status: 'checking', verification: { reviewer: 'reviewer-b', evidence: 'independently re-ran the tests' } }),
+    evidence({ kind: 'actual' }),
+  );
+  assert.equal(verified.suggestedStatus, 'running');
 });
 
 test('cancelled and uncertain defer to the coordinator with the exact state', () => {
@@ -124,7 +140,7 @@ test('actual evidence without a verification record waits', () => {
 });
 
 test('rejects unknown states', () => {
-  for (const status of ['done', 'todo', 'waiting', 'VERIFIED', '', null, undefined, 42]) {
+  for (const status of ['done', 'todo', 'waiting', 'VERIFIED', 'CHECKING', '', null, undefined, 42]) {
     assert.throws(() => dashboardHandoff(job({ status }), evidence()), /Unknown task state/);
   }
 });
