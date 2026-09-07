@@ -12,6 +12,7 @@ export function approveCheck(queue, id, { recipe, reviewer, evidence, outputs = 
   if (recipe === 'npm-test' && outputs.length) throw new Error('Tests cannot write source/build directories');
   return queue.change(id, job => {
     if (job.mode !== 'project' || job.status !== 'reported') throw new Error('Review the stopped project report before approving a command');
+    if(execFileSync('git',['-C',job.worktree,'rev-parse','HEAD'],{encoding:'utf8'}).trim()!==job.baseSha)throw new Error('Base commit changed before review');
     assertDiffScope(job.worktree, job.scope);
     const current = checkpoint(job.worktree, job.scope);
     if (current.hash !== job.checkpoint?.hash) throw new Error('Edits changed since report');
@@ -26,6 +27,7 @@ export async function runApprovedCheck(queue, id) {
   const initial = queue.get(id), approval = initial.checkApproval;
   if (!approval || initial.status !== 'reported') throw new Error('Independent command approval required');
   if (queue.get().some(j => ['launching','running','uncertain','checking'].includes(j.status))) throw new Error('Executor slot is occupied');
+  if(execFileSync('git',['-C',initial.worktree,'rev-parse','HEAD'],{encoding:'utf8'}).trim()!==initial.baseSha)throw new Error('Base commit changed after review');
   assertDiffScope(initial.worktree, initial.scope);
   if (checkpoint(initial.worktree, initial.scope).hash !== approval.checkpointHash) throw new Error('Approved edits changed');
   const pkg = JSON.parse(fs.readFileSync(path.join(initial.worktree, 'package.json'), 'utf8'));

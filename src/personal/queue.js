@@ -138,10 +138,12 @@ export class PersonalQueue {
     });
   }
 
-  verify(id, { reviewer, resultHash, evidence }) {
+  verify(id, { reviewer, resultHash, evidence, independentCheck }) {
     if (!reviewer || !evidence || evidence.length < 20) throw new Error('Independent reviewer and verification evidence required');
     return this.change(id, job => {
-      if (job.checkApproval && (job.checkResult?.code !== 0 || job.checkResult?.checkpointHash !== job.checkpoint?.hash)) throw new Error('Approved project check must pass for the current edits');
+      const recipePassed = job.checkResult?.code === 0 && job.checkResult?.checkpointHash === job.checkpoint?.hash;
+      const coordinatorChecked = independentCheck?.code === 0 && independentCheck.checkpointHash === job.checkpoint?.hash && /^[a-f0-9]{64}$/.test(independentCheck.outputHash ?? '') && typeof independentCheck.evidence === 'string' && independentCheck.evidence.length >= 20;
+      if (job.checkApproval && !recipePassed && !coordinatorChecked) throw new Error('Approved project check must pass, or coordinator must attest a separate check of the current edits');
       if (job.status !== 'reported' || job.resultHash !== resultHash) throw new Error('Verification must match a reported result');
       if (git(job.worktree, 'rev-parse', 'HEAD') !== job.baseSha) throw new Error('Base changed since execution');
       if (job.mode === 'project') {
@@ -149,6 +151,7 @@ export class PersonalQueue {
         if (checkpoint(job.worktree, job.scope).hash !== job.checkpoint?.hash) throw new Error('Edits changed since report');
       } else if (git(job.worktree, 'status', '--porcelain')) throw new Error('Worktree changed since review');
       job.verification = { reviewer, evidence, resultHash, at: new Date().toISOString() };
+      if (coordinatorChecked) job.verification.independentCheck = { mechanism: 'coordinator_attestation', code: 0, checkpointHash: independentCheck.checkpointHash, outputHash: independentCheck.outputHash, evidence: independentCheck.evidence };
       job.status = 'verified';
     });
   }
