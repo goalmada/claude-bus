@@ -382,3 +382,7 @@ the orchestrator decides what to do.
 ## License
 
 MIT. See `LICENSE`.
+
+## Opt-in personal queue
+
+A separate, disabled-by-default local review executor is available in [docs/personal-queue.md](docs/personal-queue.md). It uses private state and does not change the active bus server. Run `npm run test:personal` for fake-executor validation.

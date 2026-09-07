@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+import { PersonalQueue } from '../src/personal/queue.js';
+import { nativeClaude } from '../src/personal/claude.js';
+
+const [action, id] = process.argv.slice(2);
+try {
+  const queue = new PersonalQueue();
+  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify'].includes(action) && !id) throw new Error('Task id required');
+  let result;
+  const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
+  switch (action) {
+    case 'submit': result = queue.submit(input()); break;
+    case 'list': result = queue.get().map(({ id, status, createdAt }) => ({ id, status, createdAt })); break;
+    case 'status': {
+      const { id: taskId, status, launchId, resultHash, reason } = queue.get(id);
+      result = { id: taskId, status, launchId, resultHash, reason }; break;
+    }
+    case 'run': result = await queue.run(id, nativeClaude(queue.root)); break;
+    case 'cancel': result = queue.cancel(id); break;
+    case 'reconcile': result = queue.reconcile(id); break;
+    case 'resolve': result = queue.resolveUncertain(id, input().evidence); break;
+    case 'verify': result = queue.verify(id, input()); break;
+    default: throw new Error('Usage: personal-queue submit|list|status|run|cancel|reconcile|resolve|verify [id]. Input JSON uses stdin. State and results stay in the private queue directory.');
+  }
+  // Deliberately never print briefs, results, account details or verification evidence.
+  console.log(JSON.stringify(Array.isArray(result) ? result : { id: result.id, status: result.status, resultHash: result.resultHash, reason: result.reason }, null, 2));
+  if (result.status === 'blocked' || result.status === 'failed' || result.status === 'uncertain') process.exitCode = 2;
+} catch (error) { console.error(error instanceof SyntaxError ? 'Invalid JSON; inspect the private input or queue state' : error.message); process.exitCode = 1; }
