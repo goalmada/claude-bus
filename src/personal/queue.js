@@ -26,8 +26,14 @@ export class PersonalQueue {
 
   transaction(fn) {
     // Fail closed on a stale lock. Never steal a lease using a guessed PID.
-    try { fs.mkdirSync(this.lock, { mode: 0o700 }); }
-    catch { throw new Error('Queue locked: retry later; inspect a persistent stale lock manually'); }
+    const lockDeadline = Date.now() + 500;
+    while (true) {
+      try { fs.mkdirSync(this.lock, { mode: 0o700 }); break; }
+      catch {
+        if (Date.now() >= lockDeadline) throw new Error('Queue locked: retry later; inspect a persistent stale lock manually');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+    }
     try {
       fs.writeFileSync(path.join(this.lock, 'owner.json'), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { mode: 0o600 });
       const state = fs.existsSync(this.file) ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : { version: 1, jobs: [] };
@@ -151,7 +157,7 @@ export class PersonalQueue {
         assertDiffScope(job.worktree, job.scope);
         if (checkpoint(job.worktree, job.scope).hash !== job.checkpoint?.hash) throw new Error('Edits changed since report');
       } else if (git(job.worktree, 'status', '--porcelain')) throw new Error('Worktree changed since review');
-      job.verification = { reviewer, evidence, resultHash, at: new Date().toISOString() };
+      job.verification = { reviewer, evidence, resultHash, revision: (job.revision ?? 0) + 1, at: new Date().toISOString() };
       if (coordinatorChecked) job.verification.independentCheck = { mechanism: 'coordinator_attestation', code: 0, checkpointHash: independentCheck.checkpointHash, outputHash: independentCheck.outputHash, evidence: independentCheck.evidence };
       job.status = 'verified';
     });

@@ -43,7 +43,7 @@ test('event outbox is revisioned, replayable and excludes private text',t=>{
  const q=fixture(t);q.change('task-one',j=>{j.status='reported';j.runtime={};});
  publishEvents(q);const directory=path.join(q.root,'events');const before=fs.readdirSync(directory).map(p=>fs.readFileSync(path.join(directory,p),'utf8'));
  assert.equal(publishEvents(q),0);assert.equal(before.some(s=>s.includes('PRIVATE')),false);
- q.change('task-one',j=>{j.status='verified';j.verification={at:new Date().toISOString()};});publishEvents(q);
+ q.change('task-one',j=>{j.status='verified';j.verification={at:new Date().toISOString(),revision:j.revision+1,resultHash:j.resultHash};});publishEvents(q);
  const event=JSON.parse(fs.readFileSync(path.join(directory,`task-one.${q.get('task-one').revision}.json`)));
  assert.equal(event.independentlyVerified,true);assert.equal(event.suggestedStatus,'done');assert.equal(event.userAction,null);
 });

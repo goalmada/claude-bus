@@ -11,7 +11,7 @@ export function publishEvents(queue) {
     for (const event of job.events) {
       const target = path.join(directory, `${job.id}.${event.revision}.json`);
       if (fs.existsSync(target)) continue;
-      const verified = event.status === 'verified' && Boolean(job.verification) && event.at >= job.verification.at;
+      const verified = event.status === 'verified' && job.verification?.revision === event.revision && job.verification.resultHash === job.resultHash && event.at >= job.verification.at;
       const record = { ...job, status: event.status, revision: event.revision, events: [event], verification: verified ? job.verification : undefined };
       const summary = event.status === 'reported' ? 'Executor report ready for independent review' : `Queue execution state: ${event.status}`;
       const projection = dashboardHandoff(record, {
