@@ -5,6 +5,7 @@ import pathlib
 import plistlib
 import shutil
 import subprocess
+import time
 
 repo = pathlib.Path(__file__).resolve().parent.parent
 root = pathlib.Path.home() / '.local/state/claude-personal-queue'
@@ -35,5 +36,21 @@ plist.write_bytes(plistlib.dumps(content))
 plist.chmod(0o600)
 domain = 'gui/' + str(os.getuid())
 subprocess.run(['launchctl', 'bootout', domain + '/' + label], capture_output=True)
-subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], check=True)
+for attempt in range(20):
+    present = subprocess.run(['launchctl', 'print', domain + '/' + label], capture_output=True)
+    if present.returncode != 0:
+        break
+    time.sleep(0.25)
+else:
+    raise SystemExit('Previous supervisor has not unloaded; inspect it before retrying')
+# launchd can still be releasing a removed job after print no longer finds it.
+for attempt in range(5):
+    loaded = subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], capture_output=True)
+    if loaded.returncode == 0:
+        break
+    if subprocess.run(['launchctl', 'print', domain + '/' + label], capture_output=True).returncode == 0:
+        raise SystemExit('Supervisor exists after uncertain bootstrap; inspect before retrying')
+    time.sleep(1)
+else:
+    raise SystemExit('Supervisor bootstrap failed after bounded retries')
 print(label)
