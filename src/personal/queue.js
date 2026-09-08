@@ -154,7 +154,7 @@ export class PersonalQueue {
       if (job.status !== 'reported' || job.resultHash !== resultHash) throw new Error('Verification must match a reported result');
       if (git(job.worktree, 'rev-parse', 'HEAD') !== job.baseSha) throw new Error('Base changed since execution');
       if (job.mode === 'project') {
-        assertDiffScope(job.worktree, job.scope);
+        assertDiffScope(job.worktree, job.scope, { outputs: recipePassed ? job.checkApproval?.outputs ?? [] : [] });
         if (checkpoint(job.worktree, job.scope).hash !== job.checkpoint?.hash) throw new Error('Edits changed since report');
       } else if (git(job.worktree, 'status', '--porcelain')) throw new Error('Worktree changed since review');
       job.verification = { reviewer, evidence, resultHash, revision: (job.revision ?? 0) + 1, at: new Date().toISOString() };

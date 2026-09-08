@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
+import {assertDiffScope} from '../src/personal/workspace.js';
 import {PersonalQueue} from '../src/personal/queue.js';
 import {approveCheck,runApprovedCheck} from '../src/personal/checks.js';
 
@@ -38,4 +39,9 @@ test('reviewed npm recipe executes real child processes; stale approval and arbi
  assert.equal(verified.status,'verified');
  assert.equal(verified.checkResult.code,1);
  assert.equal(verified.verification.independentCheck.mechanism,'coordinator_attestation');
+ fs.mkdirSync(path.join(worktree,'build'));fs.writeFileSync(path.join(worktree,'build/schema.json'),'{}');
+ assert.throws(()=>assertDiffScope(worktree,verified.scope),/outside/);
+ assert.doesNotThrow(()=>assertDiffScope(worktree,verified.scope,{outputs:['build']}));
+ execFileSync('git',['-C',worktree,'add','build/schema.json']);
+ assert.throws(()=>assertDiffScope(worktree,verified.scope,{outputs:['build']}),/outside/);
 });

@@ -31,11 +31,13 @@ export function checkpoint(root, scope) {
   }
   return { files, hash: hash(JSON.stringify(files)) };
 }
-export function assertDiffScope(root, scope) {
+export function assertDiffScope(root, scope, { outputs = [] } = {}) {
+  if (outputs.some(dir => !['build', 'dist', '.next'].includes(dir))) throw new Error('Unsupported output directory');
   const changed = execFileSync('git', ['-C', root, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], { encoding: 'utf8' }).split('\0').filter(Boolean);
   for (const entry of changed) {
     const relative = entry.slice(3);
-    if (entry.includes(' -> ') || !scope.edit.includes(relative)) throw new Error('Changes outside assigned scope');
+    const generated = entry.startsWith('?? ') && outputs.some(dir => relative.startsWith(dir + '/'));
+    if (entry.includes(' -> ') || (!scope.edit.includes(relative) && !generated)) throw new Error('Changes outside assigned scope');
     scopedPath(root, relative, { missing: true });
   }
 }
