@@ -170,11 +170,13 @@ export class PersonalQueue {
     });
   }
 
-  async run(id, executor) {
+  async run(id, executor, { reservationId } = {}) {
     const launchId = crypto.randomUUID();
     const job = this.transaction(state => {
       const job = this.find(state, id);
       if (job.status !== 'queued') throw new Error('Only queued tasks can launch; never retry an uncertain launch');
+      const reservation = state.service?.runner;
+      if (reservation && !reservation.finishedAt && reservation.id !== reservationId) throw new Error('Service runner owns the executor reservation');
       if (state.jobs.some(j => inflight.has(j.status))) throw new Error('One executor at a time; reconcile unfinished launches first');
       job.attempts ??= [];
       if (job.launchId) job.attempts.push({ launchId: job.launchId, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });

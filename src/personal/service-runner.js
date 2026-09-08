@@ -13,7 +13,7 @@ const taskId = queue.transaction(state => {
 const stop = () => { try { queue.cancel(taskId); } catch {} };
 process.on('SIGTERM', stop); process.on('SIGINT', stop);
 try {
-  await queue.run(taskId, nativeClaude(queue.root));
+  await queue.run(taskId, nativeClaude(queue.root), { reservationId:runnerId });
   queue.transaction(state => {
     if (state.service?.runner?.id === runnerId) state.service.runner.finishedAt = new Date().toISOString();
   });

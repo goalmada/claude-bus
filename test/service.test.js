@@ -60,3 +60,9 @@ test('coordinator result reads require exact ownership and a complete report',t=
  assert.throws(()=>q.readResult('task-one',{...identity,owner:'another'}),/ownership/);
  assert.equal(q.readResult('task-one',identity).result,'review me');
 });
+
+test('manual dispatch cannot take a durable service reservation',async t=>{
+ const q=fixture(t);fs.writeFileSync(path.join(q.root,'native-max-verification.json'),'{}');serviceTick(q,{launch:()=>{}});
+ await assert.rejects(q.run('task-one',{prepare:()=>assert.fail('not owner')}),/owns the executor reservation/);
+ assert.equal(q.get('task-one').status,'queued');
+});
