@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { inspectNativeGate } from './native-gate-file.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
@@ -14,7 +15,8 @@ export function processBirth(pid) {
 export function serviceState(queue) {
   const state = queue.transaction(state => structuredClone(state.service ?? { enabled:false, remaining:0, runner:null }));
   const health = path.join(queue.root, 'service-health.json');
-  return { ...state, health:fs.existsSync(health) ? JSON.parse(fs.readFileSync(health,'utf8')) : null };
+  const { ok, reason } = inspectNativeGate(queue.root);
+  return { ...state, nativeGate:{ ok, reason }, health:fs.existsSync(health) ? JSON.parse(fs.readFileSync(health,'utf8')) : null };
 }
 export function configureService(queue, { enabled, launches, evidence }) {
   if (typeof enabled !== 'boolean' || !Number.isInteger(launches) || launches < 0 || launches > 5 || typeof evidence !== 'string' || evidence.length < 20) throw new Error('Explicit service configuration and at most five launch authorizations required');
@@ -44,7 +46,7 @@ export function serviceTick(queue, { launch = launchRunner, birth = processBirth
       }
     }
     const occupied = state.jobs.find(job => busy.has(job.status));
-    if (occupied) return { state:'blocked', reason:'executor_busy', taskId:occupied.id };
+    if (occupied) return { state:'blocked', reason:occupied.status === 'uncertain' ? 'executor_identity_uncertain' : 'executor_busy', taskId:occupied.id };
     const review = state.jobs.find(job => job.status === 'reported');
     if (review) return { state:'waiting', reason:'review_required', taskId:review.id };
     const stopped = state.jobs.find(job => ['blocked','failed','paused','timed_out'].includes(job.status));
@@ -54,8 +56,8 @@ export function serviceTick(queue, { launch = launchRunner, birth = processBirth
     const next = state.jobs.filter(job => job.status === 'queued').sort((a,b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0];
     if (!next) return { state:'idle' };
     // Capacity is intentionally not renewed from a timer or a successful prior run.
-    const gate = path.join(queue.root, 'native-max-verification.json');
-    if (!fs.existsSync(gate)) return { state:'blocked', reason:'fresh_native_verification_required', taskId:next.id };
+    const gate = inspectNativeGate(queue.root, now);
+    if (!gate.ok) return { state:'blocked', reason:gate.reason, taskId:next.id };
     const quota = state.jobs.find(job => job.capacity?.status === 'rejected' && !job.verification && job.status !== 'cancelled');
     if (quota) return { state:'blocked', reason:'provider_capacity_rejected', taskId:quota.id };
     reservation = { id:crypto.randomUUID(), taskId:next.id, createdAt:new Date(now).toISOString(), pid:null, birth:null };

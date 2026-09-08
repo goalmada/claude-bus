@@ -16,12 +16,16 @@ function fixture(t) {
  configureService(queue,{enabled:true,launches:2,evidence:'Explicit synthetic service test authorization'});
  return queue;
 }
+function writeGate(queue, overrides = {}) {
+ const gate={enabled:true,plan:'max',extraUsageEnabled:false,available:true,checkedAt:new Date().toISOString(),organizationId:'00000000-0000-0000-0000-000000000000',evidence:'Synthetic private gate evidence',...overrides};
+ fs.writeFileSync(path.join(queue.root,'native-max-verification.json'),JSON.stringify(gate),{mode:0o600});
+}
 test('missing native verification cannot consume launch allowance',t=>{
- const q=fixture(t);assert.equal(serviceTick(q,{launch:()=>assert.fail('must not launch')}).reason,'fresh_native_verification_required');
+ const q=fixture(t);assert.equal(serviceTick(q,{launch:()=>assert.fail('must not launch')}).reason,'native_gate_missing');
  assert.equal(serviceState(q).remaining,2);
 });
 test('durable reservation survives supervisor reconnect without a duplicate',t=>{
- const q=fixture(t);fs.writeFileSync(path.join(q.root,'native-max-verification.json'),'{}');let launches=0;
+ const q=fixture(t);writeGate(q);let launches=0;
  serviceTick(q,{launch:()=>{launches++;}});
  const reconnected=new PersonalQueue(q.root);
  assert.equal(serviceTick(reconnected,{launch:()=>launches++}).reason,'runner_starting');
@@ -30,7 +34,7 @@ test('durable reservation survives supervisor reconnect without a duplicate',t=>
  assert.equal(launches,1);assert.equal(serviceState(q).remaining,1);
 });
 test('dead runner becomes uncertain and never relaunches',t=>{
- const q=fixture(t);fs.writeFileSync(path.join(q.root,'native-max-verification.json'),'{}');
+ const q=fixture(t);writeGate(q);
  serviceTick(q,{launch:()=>{}});q.transaction(state=>Object.assign(state.service.runner,{pid:123,birth:'old'}));
  assert.equal(serviceTick(q,{birth:()=>null,launch:()=>assert.fail('no retry')}).reason,'runner_uncertain');
  assert.equal(q.get('task-one').status,'uncertain');
@@ -62,7 +66,27 @@ test('coordinator result reads require exact ownership and a complete report',t=
 });
 
 test('manual dispatch cannot take a durable service reservation',async t=>{
- const q=fixture(t);fs.writeFileSync(path.join(q.root,'native-max-verification.json'),'{}');serviceTick(q,{launch:()=>{}});
+ const q=fixture(t);writeGate(q);serviceTick(q,{launch:()=>{}});
  await assert.rejects(q.run('task-one',{prepare:()=>assert.fail('not owner')}),/owns the executor reservation/);
  assert.equal(q.get('task-one').status,'queued');
+});
+
+test('expired or malformed gate diagnostics preserve queued task and allowance',t=>{
+ const q=fixture(t);writeGate(q,{checkedAt:'2000-01-01T00:00:00.000Z'});
+ assert.equal(serviceTick(q,{launch:()=>assert.fail('no native call')}).reason,'native_gate_expired');
+ assert.equal(q.get('task-one').status,'queued');assert.equal(serviceState(q).remaining,2);
+ assert.deepEqual(serviceState(q).nativeGate,{ok:false,reason:'native_gate_expired'});
+ fs.writeFileSync(path.join(q.root,'native-max-verification.json'),'{invalid');
+ assert.equal(serviceTick(q,{launch:()=>assert.fail('no native call')}).reason,'native_gate_invalid');
+ assert.equal(serviceState(q).remaining,2);
+});
+
+test('exhausted authorization and uncertain identity remain distinct and never refill',t=>{
+ const q=fixture(t);writeGate(q);
+ configureService(q,{enabled:true,launches:0,evidence:'Explicit zero-allowance test configuration'});
+ assert.equal(serviceTick(q,{launch:()=>assert.fail('no launch')}).reason,'launch_authorization_exhausted');
+ assert.equal(serviceState(q).remaining,0);
+ q.change('task-one',j=>{j.status='uncertain';});
+ assert.equal(serviceTick(q,{launch:()=>assert.fail('no launch')}).reason,'executor_identity_uncertain');
+ assert.equal(q.get('task-one').status,'uncertain');
 });
