@@ -9,13 +9,17 @@ import path from "node:path";
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "claude-bus-mcp-"));
 const env = { ...process.env, HOME: tmp };
+const sessions = [];
 
 function startSession(name) {
-  const proc = spawn("node", ["src/server.js"], {
+  const proc = spawn(process.execPath, ["test/fixtures/session-host.js"], {
     env: { ...env, CLAUDE_BUS_NAME: name },
     cwd: new URL("..", import.meta.url).pathname,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe", "ipc"],
   });
+  const closed = new Promise((resolve) => proc.once("close", resolve));
+  const serverPid = new Promise((resolve) => proc.once("message", (m) => resolve(m.serverPid)));
+  sessions.push({ proc, closed, serverPid });
   let buffer = "";
   const waiters = [];
   proc.stdout.on("data", (chunk) => {
@@ -49,16 +53,43 @@ function startSession(name) {
   return { proc, call, init };
 }
 
-const auditor = startSession("auditor");
-const tester = startSession("tester-1");
-await auditor.init();
-await tester.init();
-
 let passed = 0, failed = 0;
+try {
+let auditor, tester;
+const order = process.env.CLAUDE_BUS_TEST_SESSION_ORDER ?? "parallel";
+if (order === "tester-first") {
+  tester = startSession("tester-1");
+  await tester.init();
+  auditor = startSession("auditor");
+  await auditor.init();
+} else if (order === "auditor-first") {
+  auditor = startSession("auditor");
+  await auditor.init();
+  tester = startSession("tester-1");
+  await tester.init();
+} else if (order === "parallel") {
+  auditor = startSession("auditor");
+  tester = startSession("tester-1");
+  await Promise.all([auditor.init(), tester.init()]);
+} else {
+  throw new Error(`Unknown test session order: ${order}`);
+}
 const assert = (cond, msg) => {
   if (cond) { passed++; console.log("  ok  " + msg); }
   else      { failed++; console.error("  FAIL " + msg); }
 };
+
+// Each real server must register against its own session host, regardless
+// of startup order. A flattened same-parent fixture fails this assertion.
+const activeDir = path.join(tmp, ".claude-bus", "active");
+const entries = await fs.readdir(activeDir);
+assert(entries.length === 2, "two independent session identity files");
+assert(auditor.proc.pid !== tester.proc.pid, "session hosts have distinct PIDs");
+for (const [session, name] of [[auditor, "auditor"], [tester, "tester-1"]]) {
+  const identity = await fs.readFile(path.join(activeDir, `${session.proc.pid}.txt`), "utf8");
+  assert(identity.trim() === name, `${name} owns its session identity`);
+}
+for (const session of sessions) process.kill(await session.serverPid, 0);
 
 // 1. List tools.
 const tools = await auditor.call("tools/list");
@@ -413,8 +444,7 @@ assert(reviveCBPayload.spawn_task_args.title === "cb: ↻ ghost worker 2",
 
 // 25. v0.9: bus_archive removes a dead worker's bus state.
 //     Use the orchestrator session to send TO a name nothing's claiming,
-//     then archive it. (We can't test live-rejection cleanly in the same
-//     process since both "sessions" share the test ppid.)
+//     then archive it.
 await auditor.call("tools/call", {
   name: "bus_send",
   arguments: { to: "to-archive", kind: "brief", body: "you can be archived" },
@@ -539,9 +569,7 @@ const runBadName = await auditor.call("tools/call", {
 assert(runBadName.result.isError === true,
   "bus_run_worker rejects path-traversal name even when auto-spawn is on");
 
-// v0.13 collision tests need tester-1 to be the LAST writer to the
-// shared active file (intermediate tests have re-claimed other names,
-// so we re-claim tester-1 here to make isPeerAlive("tester-1") true).
+// Restore tester-1 after intermediate tests claimed other identities.
 await tester.call("tools/call", {
   name: "bus_claim", arguments: { name: "tester-1" },
 });
@@ -587,14 +615,6 @@ assert((runCollision.result.content[0].text || "").includes("already alive"),
   "bus_run_worker refusal names the live-collision condition");
 
 // 41. v0.6: invalid name on bus_revive is rejected.
-//
-// (Note: a check for "revive on already-alive name flags target_was_alive"
-// would be ideal here, but in this test harness multiple "sessions" share
-// the test process's ppid and overwrite each other's active/ entries,
-// so liveness lookups for parallel sessions are unreliable. The
-// production case — each Claude Code session has its own ppid — is
-// covered indirectly by test 17, which exercises the dead-recipient
-// path that bus_revive is meant to recover from.)
 const reviveBad = await auditor.call("tools/call", {
   name: "bus_revive", arguments: { name: "../evil" },
 });
@@ -653,9 +673,24 @@ const primerText = claim2.result.content[1]?.text ?? "";
 assert(primerText.includes("bus_spawn_worker"),
   "claim response includes protocol primer");
 
-auditor.proc.kill();
-tester.proc.kill();
-await fs.rm(tmp, { recursive: true, force: true });
+} finally {
+  // Only stop hosts created by this test. Each host waits for its own
+  // server to close, including when the test parent disconnects.
+  await Promise.all(sessions.map(async ({ proc, closed }) => {
+    proc.kill("SIGTERM");
+    await closed;
+  }));
+  for (const session of sessions) {
+    const pid = await session.serverPid;
+    try {
+      process.kill(pid, 0);
+      throw new Error(`Owned test server ${pid} survived cleanup`);
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+  await fs.rm(tmp, { recursive: true, force: true });
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
