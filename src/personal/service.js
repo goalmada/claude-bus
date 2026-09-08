@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { authorizeBatch } from './authorization-batch.js';
 import { inspectNativeGate } from './native-gate-file.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -18,13 +19,11 @@ export function serviceState(queue) {
   const { ok, reason } = inspectNativeGate(queue.root);
   return { ...state, nativeGate:{ ok, reason }, health:fs.existsSync(health) ? JSON.parse(fs.readFileSync(health,'utf8')) : null };
 }
-export function configureService(queue, { enabled, launches, evidence }) {
-  if (typeof enabled !== 'boolean' || !Number.isInteger(launches) || launches < 0 || launches > 5 || typeof evidence !== 'string' || evidence.length < 20) throw new Error('Explicit service configuration and at most five launch authorizations required');
+export function configureService(queue, request) {
   return queue.transaction(state => {
-    const service = state.service ??= { remaining:0, runner:null };
-    if (service.runner && !service.runner.finishedAt) throw new Error('Do not reconfigure an owned runner');
-    Object.assign(service, { enabled, remaining:launches, authorizationEvidence:evidence, authorizedAt:new Date().toISOString() });
-    return structuredClone(service);
+    if (state.service?.authorizedAt && !state.service.authorizationId) throw new Error('Record the legacy approval before authorizing a named batch');
+    state.service = authorizeBatch(state.service ?? { remaining:0, runner:null }, request);
+    return structuredClone(state.service);
   });
 }
 
@@ -60,7 +59,7 @@ export function serviceTick(queue, { launch = launchRunner, birth = processBirth
     if (!gate.ok) return { state:'blocked', reason:gate.reason, taskId:next.id };
     const quota = state.jobs.find(job => job.capacity?.status === 'rejected' && !job.verification && job.status !== 'cancelled');
     if (quota) return { state:'blocked', reason:'provider_capacity_rejected', taskId:quota.id };
-    reservation = { id:crypto.randomUUID(), taskId:next.id, createdAt:new Date(now).toISOString(), pid:null, birth:null };
+    reservation = { id:crypto.randomUUID(), authorizationId:service.authorizationId ?? null, taskId:next.id, createdAt:new Date(now).toISOString(), pid:null, birth:null };
     service.runner = reservation;
     service.remaining--;
     return { state:'launching', taskId:next.id, runnerId:reservation.id };

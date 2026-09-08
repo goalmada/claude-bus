@@ -152,3 +152,14 @@ test('the input service and its nested history are never mutated', () => {
   assert.throws(() => authorizeBatch(service, ask({ authorizationId:'batch-0' }), NOW), /cannot be reused/);
   assert.deepEqual(service, snapshot);
 });
+
+test('malformed persisted counters cannot be interpreted as an exhausted batch', () => {
+  for (const remaining of ['4', undefined, null, NaN, -1, 6, 1.5]) {
+    assert.throws(() => authorizeBatch(granted({ remaining }), ask(), NOW), /Service authorization state/);
+  }
+  assert.throws(() => authorizeBatch(bare(), ask({ authorizationId:'   ' }), NOW), /Explicit authorization/);
+});
+
+test('revoking an unused remainder requires an explicitly disabled zero request', () => {
+  assert.throws(() => authorizeBatch(granted({ remaining:3 }), ask({ enabled:true, launches:0 }), NOW), /Revoke the unspent allowance/);
+});

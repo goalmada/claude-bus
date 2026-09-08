@@ -13,7 +13,7 @@ function fixture(t) {
  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
  const queue=new PersonalQueue(root);
  queue.transaction(state=>state.jobs.push({id:'task-one',owner:'test-owner',sourceTask:'test-source',createdAt:'2026-01-01T00:00:00.000Z',status:'queued',brief:'PRIVATE_SECRET',result:'PRIVATE_RESULT'}));
- configureService(queue,{enabled:true,launches:2,evidence:'Explicit synthetic service test authorization'});
+ configureService(queue,{authorizationId:'fixture-batch',enabled:true,launches:2,evidence:'Explicit synthetic service test authorization'});
  return queue;
 }
 function writeGate(queue, overrides = {}) {
@@ -83,10 +83,22 @@ test('expired or malformed gate diagnostics preserve queued task and allowance',
 
 test('exhausted authorization and uncertain identity remain distinct and never refill',t=>{
  const q=fixture(t);writeGate(q);
- configureService(q,{enabled:true,launches:0,evidence:'Explicit zero-allowance test configuration'});
+ configureService(q,{authorizationId:'fixture-revoke',enabled:false,launches:0,evidence:'Explicit zero-allowance test configuration'});
+ q.transaction(state=>{state.service.enabled=true;});
  assert.equal(serviceTick(q,{launch:()=>assert.fail('no launch')}).reason,'launch_authorization_exhausted');
  assert.equal(serviceState(q).remaining,0);
  q.change('task-one',j=>{j.status='uncertain';});
  assert.equal(serviceTick(q,{launch:()=>assert.fail('no launch')}).reason,'executor_identity_uncertain');
  assert.equal(q.get('task-one').status,'uncertain');
+});
+
+test('batch approval replay preserves consumed allowance and original history',t=>{
+ const q=fixture(t);writeGate(q);serviceTick(q,{launch:()=>{}});
+ const reservation=serviceState(q).runner;
+ assert.equal(reservation.authorizationId,'fixture-batch');
+ const replay=configureService(q,{authorizationId:'fixture-batch',enabled:true,launches:2,evidence:'Explicit synthetic service test authorization'});
+ assert.equal(replay.remaining,1);
+ assert.equal(replay.runner.id,reservation.id);
+ assert.throws(()=>configureService(q,{authorizationId:'fixture-batch',enabled:true,launches:5,evidence:'Explicit synthetic service test authorization'}));
+ assert.equal(serviceState(q).remaining,1);
 });

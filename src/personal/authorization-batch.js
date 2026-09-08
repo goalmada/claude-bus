@@ -12,12 +12,13 @@ export function authorizeBatch(service, request, now = new Date().toISOString())
   if (service.authorizationHistory !== undefined && !Array.isArray(service.authorizationHistory)) throw new Error(INVALID_SERVICE);
   if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error(INVALID_REQUEST);
   const { authorizationId, enabled, launches, evidence } = request;
-  if (typeof authorizationId !== 'string' || authorizationId.length === 0 || authorizationId.length > 200) throw new Error(INVALID_REQUEST);
+  if (typeof authorizationId !== 'string' || authorizationId.trim().length === 0 || authorizationId.length > 200) throw new Error(INVALID_REQUEST);
   if (typeof enabled !== 'boolean') throw new Error(INVALID_REQUEST);
   if (!Number.isInteger(launches) || launches < 0 || launches > 5) throw new Error(INVALID_REQUEST);
   if (typeof evidence !== 'string' || evidence.trim().length < 20) throw new Error(INVALID_REQUEST);
   if (typeof now !== 'string' || now.trim().length === 0 || Number.isNaN(Date.parse(now))) throw new Error(INVALID_TIME);
 
+  if (!Number.isInteger(service.remaining) || service.remaining < 0 || service.remaining > 5) throw new Error(INVALID_SERVICE);
   const updated = structuredClone(service);
   const current = typeof updated.authorizationId === 'string' && updated.authorizationId.length > 0 ? updated.authorizationId : null;
   if (current === authorizationId) {
@@ -28,7 +29,7 @@ export function authorizeBatch(service, request, now = new Date().toISOString())
   const history = Array.isArray(updated.authorizationHistory) ? updated.authorizationHistory : [];
   if (history.some(entry => entry?.authorizationId === authorizationId)) throw new Error(REUSED_ID);
   if (updated.runner && !updated.runner.finishedAt) throw new Error(ACTIVE_RUNNER);
-  if (launches > 0 && (Number.isInteger(updated.remaining) ? updated.remaining : 0) > 0) throw new Error(UNSPENT_ALLOWANCE);
+  if (updated.remaining > 0 && (launches !== 0 || enabled !== false)) throw new Error(UNSPENT_ALLOWANCE);
 
   updated.authorizationHistory = history;
   if (current !== null) history.push({

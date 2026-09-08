@@ -224,3 +224,17 @@ test('required project tools must be confirmed by actual runtime initialization'
   executor.prepare=async()=>({...await prepare(),expectedTools:['mcp__project__write_file']});
   assert.equal((await queue.run(job.id,executor)).status,'blocked');
 });
+
+test('service task records its batch and cannot reuse a finished or unrelated reservation', async t => {
+  const {queue,input}=fixture(t);const job=queue.submit(input);
+  queue.transaction(state=>{state.service={runner:{id:'reserved',taskId:job.id,authorizationId:'batch-one'}};});
+  const reported=await queue.run(job.id,fake(),{reservationId:'reserved'});
+  assert.equal(reported.authorizationId,'batch-one');
+  queue.verify(job.id,{reviewer:'test',resultHash:reported.resultHash,evidence:'Synthetic reservation attribution checked independently.'});
+  queue.transaction(state=>{state.service.runner.finishedAt=new Date().toISOString();});
+  const next=queue.submit({...input,key:'next'});
+  await assert.rejects(queue.run(next.id,fake(),{reservationId:'reserved'}),/Invalid service reservation/);
+  assert.equal(queue.get(next.id).status,'queued');
+  queue.transaction(state=>{delete state.service.runner.finishedAt;});
+  await assert.rejects(queue.run(next.id,fake(),{reservationId:'reserved'}),/Invalid service reservation/);
+});

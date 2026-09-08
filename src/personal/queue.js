@@ -176,14 +176,16 @@ export class PersonalQueue {
       const job = this.find(state, id);
       if (job.status !== 'queued') throw new Error('Only queued tasks can launch; never retry an uncertain launch');
       const reservation = state.service?.runner;
+      if (reservationId !== undefined && (!reservation || reservation.finishedAt || reservation.id !== reservationId || reservation.taskId !== id)) throw new Error('Invalid service reservation for this task');
       if (reservation && !reservation.finishedAt && reservation.id !== reservationId) throw new Error('Service runner owns the executor reservation');
       if (state.jobs.some(j => inflight.has(j.status))) throw new Error('One executor at a time; reconcile unfinished launches first');
       job.attempts ??= [];
-      if (job.launchId) job.attempts.push({ launchId: job.launchId, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });
+      if (job.launchId) job.attempts.push({ launchId: job.launchId, authorizationId:job.authorizationId ?? null, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });
       job.cancelRequested = false; job.pauseRequested = false;
       delete job.result; delete job.resultHash; delete job.runtime; delete job.reason; delete job.sessionId;
       job.status = 'launching';
       job.launchId = launchId;
+      job.authorizationId = reservation?.id === reservationId ? reservation?.authorizationId ?? null : null;
       job.startedAt = new Date().toISOString();
       return job;
     });
