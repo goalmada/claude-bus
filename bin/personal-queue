@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { runService, serviceState, configureService } from '../src/personal/service.js';
 import { PersonalQueue } from '../src/personal/queue.js';
 import { dashboardHandoff } from '../src/personal/projection.js';
 import { approveCheck, runApprovedCheck } from '../src/personal/checks.js';
@@ -14,6 +15,15 @@ try {
   let result;
   const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
   switch (action) {
+    case 'service-config': console.log(JSON.stringify(configureService(queue,input()))); process.exit(0); break;
+    case 'service-status': console.log(JSON.stringify(serviceState(queue))); process.exit(0); break;
+    case 'serve': {
+      const controller = new AbortController();
+      process.once('SIGINT', () => controller.abort()); process.once('SIGTERM', () => controller.abort());
+      let previous;
+      await runService(queue, { signal:controller.signal, onState:state=>{const serialized=JSON.stringify(state);if(serialized!==previous){console.log(serialized);previous=serialized;}} });
+      process.exit(0); break;
+    }
     case 'dispatch': console.log(JSON.stringify(await dispatchNext(queue, nativeClaude(queue.root)))); process.exit(0); break;
     case 'work': {
       const controller = new AbortController();

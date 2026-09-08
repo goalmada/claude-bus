@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { capacityFromEvent } from './capacity.js';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
@@ -227,6 +228,12 @@ export class PersonalQueue {
           if (!line.trim()) continue;
           try {
             const event = JSON.parse(line); count++;
+            const capacity = capacityFromEvent(event);
+            if (capacity) {
+              this.change(id, j => { j.capacity = capacity; });
+              if (capacity.status === 'rejected') stop('blocked');
+            }
+            if (event.type === 'system' && event.subtype === 'api_retry' && ['rate_limit','authentication_failed','billing_error','oauth_org_not_allowed'].includes(event.error)) stop('blocked');
             if (event.type === 'system' && event.subtype === 'init') {
               this.change(id, j => { j.sessionId = event.session_id ?? null; j.runtime = { tools: event.tools ?? [], mcpServers: event.mcp_servers ?? [], sessionId: event.session_id ?? null }; });
               if (spec.expectedTools?.length && (spec.expectedTools.some(tool => !event.tools?.includes(tool)) || event.tools?.some(tool => !spec.expectedTools.includes(tool)))) stop('blocked');
