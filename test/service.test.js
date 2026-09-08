@@ -52,3 +52,11 @@ test('provider capacity preserves unknown utilization and rejects unknown status
  assert.equal(capacityFromEvent({type:'rate_limit_event',rate_limit_info:{status:'rejected',resetsAt:123}}).resetsAt,123);
  assert.equal(capacityFromEvent({type:'rate_limit_event',rate_limit_info:{status:'invented'}}),null);
 });
+
+test('coordinator result reads require exact ownership and a complete report',t=>{
+ const q=fixture(t),identity={owner:'test-owner',sourceTask:'test-source'};
+ assert.throws(()=>q.readResult('task-one',identity),/complete/);
+ q.change('task-one',j=>{j.status='reported';j.result='review me';j.resultHash='hash';});
+ assert.throws(()=>q.readResult('task-one',{...identity,owner:'another'}),/ownership/);
+ assert.equal(q.readResult('task-one',identity).result,'review me');
+});

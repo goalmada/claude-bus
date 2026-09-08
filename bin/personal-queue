@@ -15,6 +15,7 @@ try {
   let result;
   const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
   switch (action) {
+    case 'result': if(!id)throw new Error('Task id required'); console.log(JSON.stringify(queue.readResult(id,input()))); process.exit(0); break;
     case 'service-config': console.log(JSON.stringify(configureService(queue,input()))); process.exit(0); break;
     case 'service-status': console.log(JSON.stringify(serviceState(queue))); process.exit(0); break;
     case 'serve': {

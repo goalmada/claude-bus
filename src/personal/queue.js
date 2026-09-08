@@ -145,6 +145,13 @@ export class PersonalQueue {
     });
   }
 
+  readResult(id, { owner, sourceTask }) {
+    const job = this.get(id);
+    if (owner !== job.owner || sourceTask !== job.sourceTask) throw new Error('Result ownership mismatch');
+    if (!['reported','verified'].includes(job.status) || typeof job.result !== 'string') throw new Error('No complete result available');
+    return { id:job.id, owner, sourceTask, revision:job.revision, status:job.status, result:job.result, resultHash:job.resultHash, checkpointHash:job.checkpoint?.hash ?? null };
+  }
+
   verify(id, { reviewer, resultHash, evidence, independentCheck }) {
     if (!reviewer || !evidence || evidence.length < 20) throw new Error('Independent reviewer and verification evidence required');
     return this.change(id, job => {
