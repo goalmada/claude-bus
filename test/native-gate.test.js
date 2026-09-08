@@ -24,9 +24,10 @@ test('accepts a fresh native Max verification', () => {
   expect(sample(), NOW + 1000, null);
 });
 
-test('an omitted clock defaults to the real current time', () => {
-  assert.deepEqual(evaluateNativeGate(sample({ checkedAt: new Date().toISOString() })), { ok: true, reason: null });
-  assert.deepEqual(evaluateNativeGate(sample()).ok, false);
+test('an omitted clock uses Date.now without a date-dependent assertion', t => {
+  t.mock.method(Date, 'now', () => NOW + 3600001);
+  assert.deepEqual(evaluateNativeGate(sample({ checkedAt: new Date(Date.now()).toISOString() })), { ok: true, reason: null });
+  assert.deepEqual(evaluateNativeGate(sample()), { ok: false, reason: 'native_gate_expired' });
 });
 
 test('missing gate is reported as missing', () => {
