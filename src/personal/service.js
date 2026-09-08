@@ -12,7 +12,9 @@ export function processBirth(pid) {
   catch { return null; }
 }
 export function serviceState(queue) {
-  return queue.transaction(state => structuredClone(state.service ?? { enabled:false, remaining:0, runner:null }));
+  const state = queue.transaction(state => structuredClone(state.service ?? { enabled:false, remaining:0, runner:null }));
+  const health = path.join(queue.root, 'service-health.json');
+  return { ...state, health:fs.existsSync(health) ? JSON.parse(fs.readFileSync(health,'utf8')) : null };
 }
 export function configureService(queue, { enabled, launches, evidence }) {
   if (typeof enabled !== 'boolean' || !Number.isInteger(launches) || launches < 0 || launches > 5 || typeof evidence !== 'string' || evidence.length < 20) throw new Error('Explicit service configuration and at most five launch authorizations required');
@@ -29,7 +31,6 @@ export function serviceTick(queue, { launch = launchRunner, birth = processBirth
   let reservation = null;
   const outcome = queue.transaction(state => {
     const service = state.service ??= { enabled:false, remaining:0, runner:null };
-    service.observedAt = new Date(now).toISOString();
     let runner = service.runner;
     if (runner && !runner.finishedAt) {
       if (runner.pid && birth(runner.pid) === runner.birth) return { state:'running', taskId:runner.taskId, runnerId:runner.id };
@@ -84,10 +85,18 @@ export async function runService(queue, { signal, intervalMs = 2000, onState = (
     fs.mkdirSync(lock, { mode:0o700 });
   }
   fs.writeFileSync(path.join(lock,'owner.json'),JSON.stringify(identity),{mode:0o600});
+  const repository = fileURLToPath(new URL('../../',import.meta.url));
+  const sourceRevision = execFileSync('git',['-C',repository,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
+  const report = outcome => {
+    const target=path.join(queue.root,'service-health.json'),temporary=target+'.tmp';
+    fs.writeFileSync(temporary,JSON.stringify({...identity,sourceRevision,observedAt:new Date().toISOString(),outcome}),{mode:0o600});
+    fs.renameSync(temporary,target);
+    onState(outcome);
+  };
   try {
     while (!signal?.aborted) {
-      try { onState(serviceTick(queue)); }
-      catch { onState({state:'blocked',reason:'service_inspection_required'}); }
+      try { report(serviceTick(queue)); }
+      catch { report({state:'blocked',reason:'service_inspection_required'}); }
       await new Promise(resolve => { const timer=setTimeout(done,intervalMs); function done(){clearTimeout(timer);signal?.removeEventListener('abort',done);resolve();} signal?.addEventListener('abort',done,{once:true}); });
     }
   } finally { fs.rmSync(lock, {recursive:true,force:true}); }
