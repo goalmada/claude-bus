@@ -1,0 +1,58 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+import { runService, serviceState, configureService } from '../src/personal/service.js';
+import { PersonalQueue } from '../src/personal/queue.js';
+import { dashboardHandoff } from '../src/personal/projection.js';
+import { approveCheck, runApprovedCheck } from '../src/personal/checks.js';
+import { nativeClaude } from '../src/personal/claude.js';
+import { dispatchNext } from '../src/personal/dispatcher.js';
+import { workQueue } from '../src/personal/worker.js';
+
+const [action, id] = process.argv.slice(2);
+try {
+  const queue = new PersonalQueue();
+  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume', 'handoff', 'approve-check', 'check'].includes(action) && !id) throw new Error('Task id required');
+  let result;
+  const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
+  switch (action) {
+    case 'result': if(!id)throw new Error('Task id required'); console.log(JSON.stringify(queue.readResult(id,input()))); process.exit(0); break;
+    case 'service-config': console.log(JSON.stringify(configureService(queue,input()))); process.exit(0); break;
+    case 'service-status': console.log(JSON.stringify(serviceState(queue))); process.exit(0); break;
+    case 'serve': {
+      const controller = new AbortController();
+      process.once('SIGINT', () => controller.abort()); process.once('SIGTERM', () => controller.abort());
+      let previous;
+      await runService(queue, { signal:controller.signal, onState:state=>{const serialized=JSON.stringify(state);if(serialized!==previous){console.log(serialized);previous=serialized;}} });
+      process.exit(0); break;
+    }
+    case 'dispatch': console.log(JSON.stringify(await dispatchNext(queue, nativeClaude(queue.root)))); process.exit(0); break;
+    case 'work': {
+      const controller = new AbortController();
+      const stop = () => controller.abort();
+      process.once('SIGINT', stop); process.once('SIGTERM', stop);
+      try { console.log(JSON.stringify(await workQueue(queue, nativeClaude(queue.root), { ...input(), signal: controller.signal, onEvent: event => console.error(JSON.stringify(event)) }))); }
+      finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+      process.exit(0); break;
+    }
+    case 'approve-check': result = approveCheck(queue, id, input()); break;
+    case 'check': result = await runApprovedCheck(queue, id); break;
+    case 'handoff': console.log(JSON.stringify(dashboardHandoff(queue.get(id), input()), null, 2)); process.exit(0); break;
+    case 'submit': result = queue.submit(input()); break;
+    case 'list': result = queue.get().map(({ id, status, createdAt }) => ({ id, status, createdAt })); break;
+    case 'status': {
+      const { id: taskId, status, revision, owner, sourceTask, launchId, resultHash, reason } = queue.get(id);
+      result = { id: taskId, status, revision, owner, sourceTask, launchId, resultHash, reason }; break;
+    }
+    case 'run': result = await queue.run(id, nativeClaude(queue.root)); break;
+    case 'pause': result = queue.pause(id); break;
+    case 'resume': result = queue.resume(id); break;
+    case 'cancel': result = queue.cancel(id); break;
+    case 'reconcile': result = queue.reconcile(id); break;
+    case 'resolve': result = queue.resolveUncertain(id, input().evidence); break;
+    case 'verify': result = queue.verify(id, input()); break;
+    default: throw new Error('Usage: personal-queue submit|list|status|run|dispatch|work|pause|resume|cancel|reconcile|resolve|verify|handoff|approve-check|check [id]. Input JSON uses stdin. State and results stay in the private queue directory.');
+  }
+  // Deliberately never print briefs, results, account details or verification evidence.
+  console.log(JSON.stringify(Array.isArray(result) ? result : { id: result.id, status: result.status, revision: result.revision, owner: result.owner, sourceTask: result.sourceTask, launchId: result.launchId, resultHash: result.resultHash, reason: result.reason }, null, 2));
+  if (result.status === 'blocked' || result.status === 'failed' || result.status === 'uncertain') process.exitCode = 2;
+} catch (error) { console.error(error instanceof SyntaxError ? 'Invalid JSON; inspect the private input or queue state' : error.message); process.exitCode = 1; }
