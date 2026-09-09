@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { publishEvents } from './service-events.js';
-import { admissionStatus, assertAdmission, taskClaimed } from './admission.js';
+import { admissionStatus, assertAdmission, taskClaimed, routingPolicy } from './admission.js';
 import { reconcileCoordination } from './coordination.js';
 import { processBirth } from './process-identity.js';
 
@@ -53,13 +53,25 @@ export function serviceTick(queue, { launch = launchRunner, birth = processBirth
     if (review) return { state:'waiting', reason:'review_required', taskId:review.id };
     const stopped = state.jobs.find(job => ['blocked','failed','paused','timed_out'].includes(job.status));
     if (stopped) return { state:'blocked', reason:'stopped_task_requires_coordinator', taskId:stopped.id };
+    let policy;
+    try { policy = routingPolicy(state); }
+    catch { return { state:'blocked', reason:'routing_policy_invalid' }; }
     if (!service.enabled) return { state:'disabled' };
-    if (service.remaining <= 0) return { state:'blocked', reason:'launch_authorization_exhausted' };
+    // Under an approved routing policy the finite trial batch is history: it is neither
+    // required nor decremented. Without a policy the legacy allowance still governs.
+    if (!policy && service.remaining <= 0) return { state:'blocked', reason:'launch_authorization_exhausted' };
     const next = state.jobs.filter(job => job.status === 'queued').sort((a,b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0];
     if (!next) return { state:'idle' };
     // Capacity is intentionally not renewed from a timer or a successful prior run.
     const gate = inspectNativeGate(queue.root, now);
-    if (!gate.ok) return { state:'blocked', reason:gate.reason, taskId:next.id };
+    if (!gate.ok) {
+      // The one hour native verification is specific to the legacy launcher this supervisor
+      // invokes. Under a routing policy it is a launcher precondition, not an authorization
+      // failure: the task stays queued, nothing is consumed and no allowance is touched.
+      return policy
+        ? { state:'waiting', reason:gate.reason, taskId:next.id, precondition:'legacy_launcher_native_gate' }
+        : { state:'blocked', reason:gate.reason, taskId:next.id };
+    }
     const quota = state.jobs.find(job => job.capacity?.status === 'rejected' && !job.verification && job.status !== 'cancelled');
     if (quota) return { state:'blocked', reason:'provider_capacity_rejected', taskId:quota.id };
     // The same bounded admission helper the direct route uses, so external launches and this
@@ -68,10 +80,16 @@ export function serviceTick(queue, { launch = launchRunner, birth = processBirth
     if (taskClaimed(state, next.id, { birth, now })) return { state:'blocked', reason:'task_identity_claimed', taskId:next.id };
     try { assertAdmission(state, { birth, now }); }
     catch { return { state:'blocked', reason:'launch_admission_full', taskId:next.id }; }
-    reservation = { id:crypto.randomUUID(), authorizationId:service.authorizationId ?? null, taskId:next.id, createdAt:new Date(now).toISOString(), pid:null, birth:null };
+    reservation = {
+      id:crypto.randomUUID(),
+      // A routed launch cites the policy and the task identity; it never consumes the old batch.
+      authorizationId:policy ? null : service.authorizationId ?? null,
+      policyId:policy?.id ?? null,
+      taskId:next.id, createdAt:new Date(now).toISOString(), pid:null, birth:null,
+    };
     service.runner = reservation;
-    service.remaining--;
-    return { state:'launching', taskId:next.id, runnerId:reservation.id };
+    if (!policy) service.remaining--;
+    return { state:'launching', taskId:next.id, runnerId:reservation.id, policyId:reservation.policyId };
   });
   if (reservation) launch(queue, reservation);
   // Durable coordination and its notification outbox are refreshed from the same loop that

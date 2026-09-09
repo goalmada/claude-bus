@@ -49,8 +49,42 @@ Two record kinds are coordination subjects, tracked where they already live:
 
 External records are normalized in place. They are never cloned into duplicate jobs. Unknown
 or missing fields stay `null` instead of being guessed, and a record without an assigned
-worktree is treated as work that expects no review (`reviewRequired: false` by default), which
-is what keeps existing image and utility launches quiet.
+worktree, without a registered candidate file and without a review state is treated as work
+that expects no review, which is what keeps existing image and utility launches quiet.
+
+The launcher writes `state: "needs_review"` together with `finishedAt` and `exit` when a run
+completes and waits for a coordinator. That combination is readiness, not settled work:
+`needs_review`, `reported`, `awaiting_review` and `ready_for_review` all normalize to a review
+state and are never allowed to fall through to `finished`. A `sha`, `headSha`, `digest`,
+`resultHash`, `checkpointHash` or `checkpointDigest` on the record is read when it is well
+formed, so a launcher that already records those facts reports them exactly.
+
+## Candidate review files
+
+Existing workers publish a JSON checkpoint beside the queue instead of calling `ready`.
+Without an adapter their finished work never reaches this mechanism, so there is one, and its
+scope is deliberately narrow:
+
+- Only `<queue root>/candidates/<file>` or `<queue root>/<file>` is read, chosen by the
+  registration's `location` (`candidates` by default, `root` for workers that already write
+  beside the queue). The name must be a plain JSON file name: no absolute path, no separator,
+  no traversal, no symlink and no path supplied at read time. The queue, its lock, the native
+  gate, the health record, the coordinator roster, retained check output and tool audits can
+  never be registered as candidates.
+- Only a file explicitly registered for one subject is read. `candidate-register` is the
+  owner's own registration and checks ownership against the record;
+  `coord-candidate-adopt` lets a coordinator register an existing owned file for a record it
+  did not create.
+- The same private file rules the native gate uses apply: regular file, owned by this user,
+  mode 0600, single link, at most 64 KiB. Anything else is ignored rather than trusted.
+- Only readiness facts are taken: SHA, digest, digest kind, checkpoint digest, evidence
+  reference, owner and awaited coordinator. Any `approved`, `verified`, `deployed` or
+  `state` claim inside the file is ignored by construction. A worker cannot approve itself by
+  writing a file.
+- The recorded time is the observed file time, clamped to now. The file's own `writtenAt` is
+  kept as `claimedAt` with `claimTrusted: false` and is never used as elapsed review time.
+- Ingestion is idempotent: an unchanged file is read and skipped, so nothing is rewritten and
+  no alert repeats.
 
 ## Process identity and progress
 
@@ -85,6 +119,13 @@ worker never republishes anything:
 - `checkpoint_changed`: the scoped checkpoint digest no longer matches.
 - `artifact_unobservable:<reason>`: the assigned worktree cannot be read. Uncertainty
   invalidates an approval rather than preserving it.
+- `checkpoint_unobservable`: a checkpoint binding exists but its digest cannot be recomputed.
+  A comparison that cannot be made is drift, never a pass.
+- `artifact_evidence_missing:<reason>`: there is nothing observable to bind to at all, for
+  example no assigned worktree or an unreadable HEAD. Approval, deployment and verification
+  require provable evidence, so they fail closed here rather than accepting silence. Plain
+  readiness display stays lenient: a subject with no assigned worktree can still wait for
+  review, it just cannot be approved.
 - `review_sha_changed`, `review_digest_changed`, `review_revision_changed`: the worker
   published a different readiness record.
 
@@ -119,13 +160,22 @@ runs every two minutes.** No scheduler, timer or application API is introduced b
 The heartbeat is the consumer and calls the CLI:
 
 ```sh
-node bin/personal-queue coordination-reconcile        # derive states, enqueue alerts, mirror files
-node bin/personal-queue notifications                 # pending records, safe metadata only
+# One compact call per heartbeat: ingest candidates, reconcile, report what is pending.
+node bin/personal-queue heartbeat
+# => {"reconciled":7,"changed":1,"ingested":1,"notified":1,"pending":[{"id":"...","taskId":"...",
+#     "kind":"external","state":"needs_review","reason":"enter_needs_review","sha":"...","at":"..."}]}
+
+# After the coordinator has seen and handled them.
 echo '{"coordinatorId":"...","coordinatorToken":"...","ids":["..."],"transport":"seguimiento-de-proyectos"}' \
   | node bin/personal-queue coord-notify-delivered
 echo '{"coordinatorId":"...","coordinatorToken":"...","ids":["..."],"note":"private:review/started"}' \
   | node bin/personal-queue coord-notify-ack
 ```
+
+`heartbeat` output is safe metadata only: identifiers, states, reasons, hashes and timestamps.
+It contains no brief, result, evidence text, candidate content, token or account identifier,
+so it can be logged as it is. `coordination-reconcile` and `notifications` remain available
+separately for inspection.
 
 An unacknowledged outbox record is not a delivered message and must never be reported as one.
 The installed service loop calls the same reconciliation every two seconds, which only makes
@@ -180,6 +230,21 @@ capacity, and it fails closed:
 - capacity `uncertain: true`, malformed, expired against its `ttlMs`, or dated in the future:
   admission refuses until the machine is observed again.
 
+Under a routing policy the finite trial batch is history. The installed supervisor no longer
+requires `service.remaining > 0` and no longer decrements it: its reservation cites the policy
+id and the task identity instead, and `service.authorizationHistory` is untouched. Without a
+policy the legacy allowance governs exactly as before.
+
+The one hour native verification is likewise not an authorization for a routed task. It is a
+precondition of the legacy native launcher that the installed supervisor invokes, so under a
+policy an expired or missing gate returns `waiting` with `precondition:
+legacy_launcher_native_gate`: the task stays queued, nothing is consumed, no allowance moves
+and no fabricated timestamp is needed. Without a policy it still blocks, unchanged. Actual
+provider failures are not relaxed anywhere: a capacity rejection, an authentication or billing
+retry event and an occupied or uncertain executor all still stop a launch. A malformed routing
+policy record fails closed with `routing_policy_invalid` rather than silently falling back to
+the legacy path. Native login and billing behaviour are unchanged by this feature.
+
 Open ended routing is not unauthenticated launching. A reservation still requires an owner
 identity, an authorized task identity, a unique task identity, the recorded policy and, for
 review bearing work, an isolated worktree. Ownership, idempotency, exact revision independent
@@ -212,6 +277,7 @@ Nothing is rewritten in place, and every counter that already exists stays as re
 | `service.machineCapacity` | New, optional, coordinator recorded. Previous records are preserved in `service.machineCapacityHistory`. |
 | `service.concurrency` | New, optional, coordinator recorded, with `service.concurrencyHistory`. |
 | `state.notifications`, `state.notificationIndex` | New. Created empty on first use. |
+| `externalLaunch.candidateSource`, `externalLaunch.review`, `externalLaunch.reviewSeq` | New per launch fields. Added only when a candidate file is registered or readiness is published. |
 | `job.coordination`, `job.review`, `job.process`, `job.progressAt` | New per task fields. Absent on old records and derived on the next reconciliation. |
 
 Backwards compatibility: with no routing policy and no new configuration, the effective limit
@@ -257,6 +323,55 @@ or delete `coordinators.json` to disable every coordinator command. Removing the
 queue. Preserve private queue state, worktrees and any in flight launch for inspection: this
 change never kills, relaunches or finalizes work on its own.
 
+## Migrating a running supervisor without disturbing active launches
+
+This upgrade is state compatible and does not need the supervisor to stop. The safe order is:
+
+1. **Observe first, change nothing.** From this checkout, with the supervisor still running:
+
+   ```sh
+   node bin/personal-queue admission          # limit, source, occupied slots, uncertain slots
+   node bin/personal-queue coordination-list  # subjects that already carry a coordination state
+   ```
+
+   `admission` is read only. Confirm the occupied slots match the launches you believe are
+   live before anything else.
+
+2. **Record the coordinator roster, the routing policy and the machine capacity** exactly as
+   in the install section above. None of these touch a running launch, and none of them enable
+   the service.
+
+3. **Map the readiness that already exists.** For each active launch that has finished and is
+   waiting, register the checkpoint file its worker already wrote, then reconcile:
+
+   ```sh
+   # location: "candidates" for <root>/candidates/<file>, "root" for <root>/<file>
+   echo '{"coordinatorId":"<id>","coordinatorToken":"<token>","file":"<name>.json","location":"root"}' \
+     | node bin/personal-queue coord-candidate-adopt <launch-id>
+   node bin/personal-queue coordination-reconcile
+   node bin/personal-queue coordination <launch-id>
+   ```
+
+   Check that the reported SHA and digest are the ones you intend to review. If a launch has no
+   candidate file, its owner can call `ready` instead; a launcher record that already carries
+   `state: "needs_review"` is picked up with no action at all.
+
+4. **Do not finalize live launches to make them tidy.** A record whose process is still alive
+   stays occupied on purpose. Let it exit, or finalize it only after observing the exit.
+
+5. **Wire the heartbeat** by adding `node bin/personal-queue heartbeat` and the two
+   acknowledgement calls to the existing `seguimiento-de-proyectos` run.
+
+6. **Restart the supervisor only when convenient.** The new admission and reconciliation code
+   is used by whichever supervisor process runs next; an already running one keeps its current
+   behaviour until then, and its durable reservation is unaffected by the upgrade. The first
+   reconciliation after the restart adopts existing records without touching settled work older
+   than the adoption window.
+
+Reversing any step is a matter of removing the record it created: the roster file, the routing
+policy, the machine capacity or a candidate registration. No launch, worktree or historical
+counter is modified by this migration.
+
 ## Known limits
 
 - The coordination state is advisory metadata. It never rewrites the legacy execution
@@ -279,6 +394,14 @@ change never kills, relaunches or finalizes work on its own.
   record is not detected by this code.
 - Notification records are retained until acknowledged, and acknowledged records are trimmed
   beyond 1000. The dedupe index is pruned only for subjects that no longer exist.
+- The candidate adapter reads only registered files inside the private candidates directory.
+  A worker that writes its checkpoint somewhere else is not reached until that file is placed
+  there and registered, which is deliberate: no path is read on trust.
+- A candidate file supplies readiness only. It is evidence that a worker says its work is
+  ready, not evidence that the work is correct, and it can never carry an approval.
+- Under a routing policy the installed supervisor still invokes the legacy native launcher,
+  which enforces its own account verification. That is why an expired gate leaves routed work
+  queued rather than launching it.
 - Everything in this repository is generic code and synthetic tests. No live queue content,
   task text, account identifier or credential belongs here.
 

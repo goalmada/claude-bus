@@ -281,3 +281,101 @@ test('a duplicate record under a claimed identity is never hidden behind a reser
   assert.deepEqual(occupiedSlots(queue.snapshot(), observed)[0].kinds, ['runner', 'external']);
   assert.throws(() => assertAdmission(queue.snapshot(), { ...observed, claim }), /One executor at a time/);
 });
+
+// The gate file the legacy launcher requires. Its freshness is a launcher precondition, not
+// an authorization for a routed task.
+function writeGate(queue, checkedAt) {
+  fs.writeFileSync(path.join(queue.root, 'native-max-verification.json'), JSON.stringify({
+    enabled: true, plan: 'max', extraUsageEnabled: false, available: true, checkedAt,
+    organizationId: '00000000-0000-0000-0000-000000000000', evidence: 'Synthetic private gate evidence',
+  }), { mode: 0o600 });
+}
+
+function queuedTask(queue) {
+  queue.transaction(state => state.jobs.push({
+    id: 'task-one', owner: 'test-owner', sourceTask: 'test-source',
+    createdAt: '2026-01-01T00:00:00.000Z', status: 'queued',
+  }));
+}
+
+test('a routed service launch cites the policy and never consumes the legacy trial batch', t => {
+  const queue = fixture(t);
+  legacyLedger(queue);
+  queuedTask(queue);
+  const role = roster(queue);
+  routed(queue, role, 3);
+  writeGate(queue, new Date(NOW - 60000).toISOString());
+
+  const before = queue.snapshot().service;
+  const outcome = serviceTick(queue, { birth: () => null, now: NOW, launch: () => {} });
+  assert.equal(outcome.state, 'launching');
+  assert.equal(outcome.policyId, POLICY);
+  const after = queue.snapshot().service;
+  // The old counter is history: not required, not decremented, not refilled.
+  assert.equal(after.remaining, before.remaining);
+  assert.equal(after.runner.policyId, POLICY);
+  assert.equal(after.runner.authorizationId, null);
+  assert.deepEqual(after.authorizationHistory, before.authorizationHistory);
+});
+
+test('an exhausted legacy batch no longer blocks a routed launch but still blocks without a policy', t => {
+  const queue = fixture(t);
+  queuedTask(queue);
+  const role = roster(queue);
+  writeGate(queue, new Date(NOW - 60000).toISOString());
+  queue.transaction(state => { state.service = { ...(state.service ?? {}), enabled: true, remaining: 0, runner: null }; });
+  // Without a policy the historical allowance still governs, exactly as before.
+  assert.equal(serviceTick(queue, { birth: () => null, now: NOW, launch: () => assert.fail('no launch') }).reason, 'launch_authorization_exhausted');
+
+  routed(queue, role, 3);
+  const outcome = serviceTick(queue, { birth: () => null, now: NOW, launch: () => {} });
+  assert.equal(outcome.state, 'launching');
+  assert.equal(queue.snapshot().service.remaining, 0);
+});
+
+test('an expired native gate is a launcher precondition under a policy, not a consumed failure', t => {
+  const queue = fixture(t);
+  queuedTask(queue);
+  const role = roster(queue);
+  writeGate(queue, '2000-01-01T00:00:00.000Z');
+  queue.transaction(state => { state.service = { ...(state.service ?? {}), enabled: true, remaining: 2, runner: null }; });
+  // Legacy behaviour is unchanged: an expired gate blocks.
+  assert.deepEqual(serviceTick(queue, { birth: () => null, now: NOW, launch: () => assert.fail('no launch') }), { state: 'blocked', reason: 'native_gate_expired', taskId: 'task-one' });
+
+  routed(queue, role, 3);
+  const outcome = serviceTick(queue, { birth: () => null, now: NOW, launch: () => assert.fail('no launch') });
+  assert.equal(outcome.state, 'waiting');
+  assert.equal(outcome.reason, 'native_gate_expired');
+  assert.equal(outcome.precondition, 'legacy_launcher_native_gate');
+  // Nothing was consumed and the task is still queued for later.
+  assert.equal(queue.snapshot().service.remaining, 2);
+  assert.equal(queue.snapshot().service.runner, null);
+  assert.equal(queue.get('task-one').status, 'queued');
+});
+
+test('an actual provider capacity rejection still blocks under a routing policy', t => {
+  const queue = fixture(t);
+  queuedTask(queue);
+  const role = roster(queue);
+  routed(queue, role, 3);
+  writeGate(queue, new Date(NOW - 60000).toISOString());
+  queue.transaction(state => {
+    state.service.enabled = true;
+    state.jobs.push({ id: 'task-rejected', owner: 'test-owner', sourceTask: 'test-source', createdAt: '2026-01-02T00:00:00.000Z', status: 'cancelled', capacity: { status: 'rejected', observedAt: '2026-09-08T11:00:00.000Z' } });
+  });
+  queue.change('task-rejected', job => { job.status = 'queued'; });
+  const outcome = serviceTick(queue, { birth: () => null, now: NOW, launch: () => assert.fail('no launch') });
+  assert.deepEqual(outcome, { state: 'blocked', reason: 'provider_capacity_rejected', taskId: 'task-rejected' });
+  assert.equal(queue.snapshot().service.runner, null);
+});
+
+test('a malformed routing policy fails closed instead of silently falling back', t => {
+  const queue = fixture(t);
+  queuedTask(queue);
+  queue.transaction(state => {
+    state.service = { enabled: true, remaining: 2, runner: null, routingPolicy: { id: 'broken', mode: 'anything_goes', provider: 'somewhere_else' } };
+  });
+  assert.deepEqual(serviceTick(queue, { birth: () => null, now: NOW, launch: () => assert.fail('no launch') }), { state: 'blocked', reason: 'routing_policy_invalid' });
+  assert.throws(() => launchLimit(queue.snapshot()), /not a recognised authorized-task native route/);
+  assert.equal(queue.snapshot().service.remaining, 2);
+});

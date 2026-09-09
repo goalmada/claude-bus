@@ -40,15 +40,25 @@ export function memoizedObserver(observe = observeSubject) {
 // Compares the durable binding (a readiness record or a coordinator approval) with what the
 // filesystem actually shows now. An assigned worktree that cannot be read is drift, not
 // silence: uncertainty invalidates an approval rather than preserving it.
-export function artifactDrift(bound, observation) {
-  if (!bound || !observation) return null;
-  if (!observation.available) return observation.reason === 'no_assigned_worktree' ? null : `artifact_unobservable:${observation.reason}`;
+// `requireEvidence` is set wherever a decision depends on the artifact still being provable,
+// which is every approval, deployment and verification. In that mode the absence of evidence
+// is drift: an unreadable worktree, no assigned worktree at all, or a checkpoint binding whose
+// digest cannot be recomputed all invalidate rather than silently pass.
+export function artifactDrift(bound, observation, { requireEvidence = false } = {}) {
+  if (!bound) return null;
+  if (!observation) return requireEvidence ? 'artifact_evidence_missing:no_observation' : null;
+  if (!observation.available) {
+    if (observation.reason === 'no_assigned_worktree') return requireEvidence ? 'artifact_evidence_missing:no_assigned_worktree' : null;
+    return `artifact_unobservable:${observation.reason}`;
+  }
+  if (bound.sha && !observation.headSha) return requireEvidence ? 'artifact_evidence_missing:head_unobservable' : null;
   if (bound.sha && observation.headSha && bound.sha !== observation.headSha) return 'head_moved';
   // Scoped project work is bound to its checkpoint, so uncommitted edits inside the assigned
   // scope are expected: the checkpoint digest, not the dirty flag, is the honest comparison.
   const checkpointBinding = bound.digestKind === 'checkpoint' ? bound.digest : bound.checkpointDigest;
   if (checkpointBinding) {
-    return observation.checkpointHash && observation.checkpointHash !== checkpointBinding ? 'checkpoint_changed' : null;
+    if (!observation.checkpointHash) return 'checkpoint_unobservable';
+    return observation.checkpointHash !== checkpointBinding ? 'checkpoint_changed' : null;
   }
   if (observation.dirty) return 'worktree_modified';
   return null;

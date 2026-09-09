@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 
 // Process identity for coordination. A living PID is never proof of progress and a PID
 // alone is never enough to act on: identity is the pair (pid, birth) plus the last
@@ -16,13 +16,23 @@ export function processBirth(pid) {
   catch { return null; }
 }
 
+// The same observation without blocking the caller. A supervisor must not stall its own
+// executor stream to learn a process birth, so the launch path records the PID first and
+// fills in the birth as soon as this returns.
+export function observeBirth(pid, done) {
+  if (!Number.isInteger(pid) || pid <= 0) { done(null); return; }
+  execFile('/bin/ps', ['-p', String(pid), '-o', 'lstart='], { timeout: 2000, encoding: 'utf8' }, (error, stdout) => {
+    done(error ? null : stdout.trim() || null);
+  });
+}
+
 // Legacy jobs recorded only `pid`. Newer launches also record the birth timestamp, which is
 // what makes a later observation provable rather than a guess about a reusable number.
 export function processFacts(job) {
   const recorded = job?.process && typeof job.process === 'object' ? job.process : null;
   const pid = Number.isInteger(recorded?.pid) ? recorded.pid : Number.isInteger(job?.pid) ? job.pid : null;
   const birth = typeof recorded?.birth === 'string' && recorded.birth.length ? recorded.birth : null;
-  return { pid, birth, startedAt: recorded?.startedAt ?? job?.startedAt ?? null };
+  return { pid, birth, birthPending: recorded?.birthPending === true, startedAt: recorded?.startedAt ?? job?.startedAt ?? null };
 }
 
 const time = value => { const parsed = Date.parse(value ?? ''); return Number.isFinite(parsed) ? parsed : null; };
@@ -63,8 +73,13 @@ export function reconcileIdentity(job, {
   }
   const observed = birth(facts.pid);
   if (observed === null || observed === undefined) return { ...base, state: 'exited', reason: active ? 'unexpected_exit' : 'process_exited' };
-  // A living PID without a recorded birth cannot be attributed to this launch.
-  if (facts.birth === null) return { ...base, state: 'unprovable', reason: 'identity_unprovable' };
+  // A living PID without a recorded birth cannot be attributed to this launch. The launch path
+  // records the birth just after the PID, so only that short window is treated as starting.
+  if (facts.birth === null) {
+    const started = time(facts.startedAt);
+    if (facts.birthPending && started !== null && now - started < identityGraceMs) return { ...base, state: 'starting', reason: 'identity_pending' };
+    return { ...base, state: 'unprovable', reason: 'identity_unprovable' };
+  }
   if (observed !== facts.birth) return { ...base, state: 'reused', reason: 'identity_mismatch' };
   return { ...base, state: 'confirmed', reason: stale ? 'stale_running' : 'process_confirmed' };
 }

@@ -7,8 +7,8 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { PersonalQueue } from '../src/personal/queue.js';
 import {
-  publishReadiness, publishProgress, reconcileCoordination, coordinationView,
-  coordinationSummary, coordinationFor, normalizeSubject, reviewFacts,
+  publishReadiness, publishProgress, registerCandidateSource, reconcileCoordination,
+  coordinationView, coordinationSummary, coordinationFor, normalizeSubject, reviewFacts,
 } from '../src/personal/coordination.js';
 import * as coordinator from '../src/personal/coordinator.js';
 import { reserveLaunch, attachExternalProcess, finalizeExternalLaunch } from '../src/personal/admission.js';
@@ -364,4 +364,190 @@ test('coordination derivation is pure and reports incomplete review evidence', (
   assert.equal(outcome.state, 'needs_review');
   assert.match(outcome.reason, /^review_evidence_incomplete:/);
   assert.equal(reviewFacts(subject).source, 'legacy_reported');
+});
+
+// The record shape the existing launcher actually writes when a routed run finishes and waits
+// for review, together with the candidate checkpoint file those workers publish beside the
+// queue instead of calling `ready`.
+const launcherRecord = (overrides = {}) => ({
+  id: 'ext-live', authorizationId: null, policyId: 'native-authorized-tasks-open-20260908',
+  owner: 'worker-owner', coordinator: 'root-coordinator', state: 'needs_review',
+  createdAt: '2026-09-08T11:00:00.000Z', attachedAt: '2026-09-08T11:00:05.000Z',
+  finishedAt: '2026-09-08T11:58:00.000Z', exit: 0, pid: 4321, birth: BIRTH,
+  worktree: null, taskId: 'authorized-task-1', purpose: 'reliability', reviewRequired: true,
+  ...overrides,
+});
+
+function writeCandidate(queue, name, candidate) {
+  const directory = path.join(queue.root, 'candidates');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(directory, name), JSON.stringify(candidate), { mode: 0o600 });
+}
+
+test('a finished launcher record waiting for review is readiness, not finished work', t => {
+  const { queue } = fixture(t);
+  queue.transaction(state => { state.service = { enabled: false, remaining: 1, runner: null, externalLaunches: [launcherRecord()] }; });
+  reconcileCoordination(queue, { birth: () => null, now: NOW });
+  const view = coordinationView(queue, 'ext-live');
+  assert.equal(view.subjectKind, 'external');
+  // Before this fix the record normalized to `finished` and reported finished_without_review.
+  assert.equal(view.coordination.state, 'needs_review');
+  assert.notEqual(view.coordination.reason, 'finished_without_review');
+  assert.equal(view.coordination.owner, 'worker-owner');
+  assert.equal(view.coordination.coordinator, 'root-coordinator');
+  // Its own execution record is never rewritten.
+  assert.equal(queue.snapshot().service.externalLaunches[0].state, 'needs_review');
+});
+
+test('a launcher record carrying its own sha and digest reports them exactly', t => {
+  const { queue } = fixture(t);
+  queue.transaction(state => {
+    state.service = { enabled: false, remaining: 1, runner: null, externalLaunches: [launcherRecord({ sha: sha('launcher-head'), digest: digestOf('launcher-result') })] };
+  });
+  reconcileCoordination(queue, { birth: () => null, now: NOW });
+  const view = coordinationView(queue, 'ext-live').coordination;
+  assert.equal(view.state, 'needs_review');
+  assert.equal(view.reason, 'awaiting_coordinator_review');
+  assert.equal(view.sha, sha('launcher-head'));
+  assert.equal(view.digest, digestOf('launcher-result'));
+});
+
+test('a registered candidate file supplies readiness and never an approval', t => {
+  const project = repository(t);
+  const { queue } = fixture(t);
+  queue.transaction(state => { state.service = { enabled: false, remaining: 1, runner: null, externalLaunches: [launcherRecord({ worktree: project.worktree })] }; });
+  writeCandidate(queue, 'ext-live.json', {
+    // The shape an existing worker writes, including claims this mechanism must ignore.
+    owner: 'worker-owner', reviewer: 'root-coordinator',
+    sha: project.head(), resultHash: digestOf('candidate-1'),
+    evidence: 'private:candidate/ext-live', writtenAt: '2099-01-01T00:00:00.000Z',
+    approved: true, verified: true, deployed: true, state: 'verified',
+  });
+  const registered = registerCandidateSource(queue, 'ext-live', { owner: 'worker-owner', file: 'ext-live.json', birth: () => null, now: NOW });
+  assert.equal(registered.candidateSource.ingested, true);
+
+  const view = coordinationView(queue, 'ext-live').coordination;
+  assert.equal(view.state, 'needs_review');
+  assert.equal(view.reviewSource, 'candidate_file');
+  assert.equal(view.sha, project.head());
+  assert.equal(view.digest, digestOf('candidate-1'));
+  assert.equal(view.evidenceRef, 'private:candidate/ext-live');
+  // Self-declared approval, verification and deployment inside the file are ignored.
+  assert.equal(view.approvedBy, null);
+  assert.equal(view.verifiedBy, null);
+  assert.equal(view.deployingSince, null);
+  // The file's own written-at claim is never used as elapsed time.
+  const review = queue.snapshot().service.externalLaunches[0].review;
+  assert.equal(review.claimTrusted, false);
+  assert.equal(review.claimedAt, '2099-01-01T00:00:00.000Z');
+  assert.ok(Date.parse(review.at) <= Date.now());
+
+  // Re-reading an unchanged candidate is idempotent: no new revision, no new alert.
+  const before = queue.snapshot().service.externalLaunches[0].reviewSeq;
+  for (const step of [1, 2, 3]) reconcileCoordination(queue, { birth: () => null, now: NOW + step * 1000 });
+  assert.equal(queue.snapshot().service.externalLaunches[0].reviewSeq, before);
+  assert.equal(coordinationView(queue, 'ext-live').coordination.state, 'needs_review');
+});
+
+test('candidate registration is scoped, ownership checked and never reads arbitrary paths', t => {
+  const { queue } = fixture(t);
+  queue.transaction(state => { state.service = { enabled: false, remaining: 1, runner: null, externalLaunches: [launcherRecord()] }; });
+  const base = { owner: 'worker-owner', birth: () => null, now: NOW };
+  for (const file of ['../../etc/passwd', '/etc/passwd', 'nested/path.json', 'no-extension', '.hidden.json', 'a'.repeat(200) + '.json']) {
+    assert.throws(() => registerCandidateSource(queue, 'ext-live', { ...base, file }), /plain JSON file name/);
+  }
+  assert.throws(() => registerCandidateSource(queue, 'ext-live', { ...base, owner: 'someone-else', file: 'ext-live.json' }), /ownership mismatch/);
+
+  // A registered file that is missing, unreadable or not owned readiness leaves no claim.
+  registerCandidateSource(queue, 'ext-live', { ...base, file: 'ext-live.json' });
+  assert.equal(queue.snapshot().service.externalLaunches[0].review, undefined);
+  writeCandidate(queue, 'ext-live.json', { owner: 'a-different-worker', sha: sha('x'), resultHash: digestOf('y') });
+  reconcileCoordination(queue, { birth: () => null, now: NOW });
+  assert.equal(queue.snapshot().service.externalLaunches[0].review, undefined);
+  // A world readable candidate is refused by the same private file rules the gate uses.
+  writeCandidate(queue, 'ext-live.json', { owner: 'worker-owner', sha: sha('x'), resultHash: digestOf('y') });
+  fs.chmodSync(path.join(queue.root, 'candidates', 'ext-live.json'), 0o644);
+  reconcileCoordination(queue, { birth: () => null, now: NOW + 1000 });
+  assert.equal(queue.snapshot().service.externalLaunches[0].review, undefined);
+});
+
+test('approval requires provable artifact evidence and fails closed without it', t => {
+  const { queue } = fixture(t, [liveJob({ id: 'task-no-worktree', status: 'running', worktree: null })]);
+  const role = roster(queue);
+  const birth = () => BIRTH;
+  publishReadiness(queue, 'task-no-worktree', {
+    owner: 'worker-owner', coordinator: 'root-coordinator', sha: sha('unprovable'), digest: digestOf('unprovable'),
+    evidenceRef: 'private:review/no-worktree', birth, now: NOW,
+  });
+  assert.equal(coordinationView(queue, 'task-no-worktree').coordination.state, 'needs_review');
+  // Nothing observable backs this readiness, so it cannot be approved.
+  assert.throws(() => coordinator.approve(queue, 'task-no-worktree', {
+    ...role, sha: sha('unprovable'), digest: digestOf('unprovable'),
+    evidence: 'Attempting to approve work with no observable artifact.', birth, now: NOW + 1000,
+  }), /not currently provable \(artifact_evidence_missing:no_assigned_worktree\)/);
+});
+
+test('an approval whose artifact stops being observable becomes stale', t => {
+  const project = repository(t);
+  const { queue } = fixture(t, [liveJob({ id: 'task-vanishing', status: 'running', worktree: project.worktree, baseSha: project.head() })]);
+  const role = roster(queue);
+  const birth = () => BIRTH;
+  publishReadiness(queue, 'task-vanishing', {
+    owner: 'worker-owner', coordinator: 'root-coordinator', sha: project.head(), digest: digestOf('vanishing'),
+    evidenceRef: 'private:review/vanishing', birth, now: NOW,
+  });
+  coordinator.approve(queue, 'task-vanishing', {
+    ...role, sha: project.head(), digest: digestOf('vanishing'),
+    evidence: 'Reviewed the artifact at the exact commit before it moved.', birth, now: NOW + 1000,
+  });
+  assert.equal(coordinationView(queue, 'task-vanishing').coordination.state, 'approved');
+  // The assigned worktree is gone: uncertainty invalidates rather than preserving.
+  fs.rmSync(project.worktree, { recursive: true, force: true });
+  reconcileCoordination(queue, { birth, now: NOW + 2000 });
+  const view = coordinationView(queue, 'task-vanishing').coordination;
+  assert.equal(view.state, 'needs_review');
+  assert.match(view.reason, /^approval_stale:artifact_unobservable:/);
+  assert.throws(() => coordinator.startDeployment(queue, 'task-vanishing', { ...role, evidence: 'Deploying an unobservable approval must fail.', birth, now: NOW + 3000 }), /current approval/);
+});
+
+test('a checkpoint binding that cannot be recomputed is drift, not silence', t => {
+  const project = repository(t);
+  const scope = { read: ['source.txt'], edit: ['source.txt'], tests: ['test/unit.test.js'] };
+  const { queue } = fixture(t, [liveJob({ id: 'task-checkpoint', status: 'running', worktree: project.worktree, baseSha: project.head(), scope })]);
+  const role = roster(queue);
+  const birth = () => BIRTH;
+  const checkpointDigest = digestOf('checkpoint-1');
+  publishReadiness(queue, 'task-checkpoint', {
+    owner: 'worker-owner', coordinator: 'root-coordinator', sha: project.head(),
+    digest: checkpointDigest, digestKind: 'checkpoint', evidenceRef: 'private:review/checkpoint', birth, now: NOW,
+  });
+  // The observed checkpoint of the real worktree does not match this synthetic digest, so the
+  // binding is drift; it must not pass merely because a hash could not be produced.
+  assert.throws(() => coordinator.approve(queue, 'task-checkpoint', {
+    ...role, sha: project.head(), digest: checkpointDigest,
+    evidence: 'Attempting to approve an unmatched checkpoint binding.', birth, now: NOW + 1000,
+  }), /not currently provable \(checkpoint_/);
+});
+
+test('a candidate written directly beside the queue is supported, private state files are not', t => {
+  const { queue } = fixture(t);
+  queue.transaction(state => { state.service = { enabled: false, remaining: 1, runner: null, externalLaunches: [launcherRecord()] }; });
+  fs.writeFileSync(path.join(queue.root, 'ext-live-checkpoint.json'), JSON.stringify({
+    owner: 'worker-owner', reviewer: 'root-coordinator', headSha: sha('beside-queue'),
+    artifactDigest: digestOf('beside-queue'), report: 'private:candidate/beside-queue',
+  }), { mode: 0o600 });
+  registerCandidateSource(queue, 'ext-live', { owner: 'worker-owner', file: 'ext-live-checkpoint.json', location: 'root', birth: () => null, now: NOW });
+  const view = coordinationView(queue, 'ext-live').coordination;
+  assert.equal(view.state, 'needs_review');
+  assert.equal(view.sha, sha('beside-queue'));
+  assert.equal(view.digest, digestOf('beside-queue'));
+  assert.equal(view.digestKind, 'artifact');
+
+  // Private state files can never be registered as review candidates, in any location.
+  for (const file of ['queue.json', 'native-max-verification.json', 'coordinators.json', 'service-health.json']) {
+    assert.throws(() => registerCandidateSource(queue, 'ext-live', { owner: 'worker-owner', file, location: 'root', birth: () => null, now: NOW }), /not a review candidate/);
+  }
+  assert.throws(() => registerCandidateSource(queue, 'ext-live', { owner: 'worker-owner', file: 'ext-live.json', location: 'anywhere', birth: () => null, now: NOW }), /Candidate location/);
+  // The earlier valid registration is untouched by the refused ones.
+  assert.equal(queue.snapshot().service.externalLaunches[0].candidateSource.file, 'ext-live-checkpoint.json');
 });

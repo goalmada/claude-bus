@@ -1,6 +1,7 @@
 import { reconcileIdentity, processFacts, ACTIVE_STATUSES, DEFAULT_STALE_MS, DEFAULT_IDENTITY_GRACE_MS } from './process-identity.js';
 import { enqueueNotification, publishNotificationFiles, pruneNotificationIndex, safeReference } from './notifications.js';
 import { memoizedObserver, artifactDrift } from './artifact.js';
+import { attachCandidateSource, ingestCandidates } from './candidates.js';
 
 // Durable coordination state for personal queue work. This extends the existing queue
 // instead of adding a second queue or monitor: a `coordination` record is derived from facts
@@ -41,6 +42,12 @@ const SETTLED = new Set(['finished', 'released', 'cancelled']);
 const EXTERNAL_STATUS = new Map([
   ['reserved', 'launching'],
   ['running', 'running'],
+  // The launcher writes a review state together with `finishedAt` and `exit`. That record is
+  // work waiting for a coordinator, not settled work: it must not fall through to `finished`.
+  ['needs_review', 'reported'],
+  ['reported', 'reported'],
+  ['awaiting_review', 'reported'],
+  ['ready_for_review', 'reported'],
   ['finished', 'finished'],
   // A worker declaring its own work verified is not a verification; it is finished work.
   ['verified', 'finished'],
@@ -51,6 +58,8 @@ const EXTERNAL_STATUS = new Map([
 
 const iso = now => new Date(now).toISOString();
 const text = value => typeof value === 'string' && value.trim().length > 0;
+// Existing launcher records carry these under several names. Only well formed values are read.
+const hex = (value, pattern) => (text(value) && pattern.test(value.trim()) ? value.trim() : null);
 const time = value => { const parsed = Date.parse(value ?? ''); return Number.isFinite(parsed) ? parsed : null; };
 
 // The revision at which a legacy job entered `reported`. Using the live job revision would
@@ -101,7 +110,9 @@ export function normalizeSubject(record, kind = 'job') {
     owner: text(record.owner) ? record.owner : null,
     coordinator: text(record.coordinator) ? record.coordinator : text(record.authorizedBy) ? record.authorizedBy : null,
     worktree: text(record.worktree) ? record.worktree : null, scope: record.scope ?? null,
-    baseSha: text(record.baseSha) ? record.baseSha : null, resultHash: null, checkpointHash: null,
+    baseSha: hex(record.baseSha, FULL_SHA) ?? hex(record.sha, FULL_SHA) ?? hex(record.headSha, FULL_SHA),
+    resultHash: hex(record.resultHash, DIGEST) ?? hex(record.digest, DIGEST),
+    checkpointHash: hex(record.checkpointHash, DIGEST) ?? hex(record.checkpointDigest, DIGEST),
     launchId: record.id, revision: Number.isInteger(record.reviewSeq) ? record.reviewSeq : null,
     events: [],
     process: { pid: Number.isInteger(record.pid) ? record.pid : null, birth: text(record.birth) ? record.birth : null, startedAt: record.attachedAt ?? record.createdAt ?? null },
@@ -110,8 +121,11 @@ export function normalizeSubject(record, kind = 'job') {
     progressAt: record.progressAt ?? null, capacityAt: null,
     review: record.review ?? null, coordination: record.coordination ?? null,
     legacyVerification: null,
-    // Image and utility launches carry no worktree and expect no review; routed task work does.
-    expectsReview: typeof record.reviewRequired === 'boolean' ? record.reviewRequired : text(record.worktree),
+    // Image and utility launches carry no worktree and expect no review; routed task work, a
+    // registered candidate file and an explicit review state all do.
+    expectsReview: typeof record.reviewRequired === 'boolean'
+      ? record.reviewRequired
+      : Boolean(text(record.worktree) || record.candidateSource || EXTERNAL_STATUS.get(record.state) === 'reported'),
     settledAt: record.finishedAt ?? null,
     policyId: record.policyId ?? null, taskId: record.taskId ?? null,
     record,
@@ -170,7 +184,12 @@ export function approvalDrift(review, approval, observation) {
   if (approval.sha !== review.sha) return 'review_sha_changed';
   if (approval.digest !== review.digest) return 'review_digest_changed';
   if (approval.reviewRevision !== review.revision) return 'review_revision_changed';
-  return artifactDrift({ sha: approval.sha, digest: approval.digest, digestKind: approval.digestKind, checkpointDigest: approval.checkpointDigest ?? null }, observation);
+  // An approval must keep observable artifact evidence. Missing evidence is drift, not silence.
+  return artifactDrift(
+    { sha: approval.sha, digest: approval.digest, digestKind: approval.digestKind, checkpointDigest: approval.checkpointDigest ?? null },
+    observation,
+    { requireEvidence: true },
+  );
 }
 
 export function coordinationFor(subject, options = {}) {
@@ -332,8 +351,11 @@ export function refreshSubject(state, subject, options = {}) {
 export function reconcileCoordination(queue, options = {}) {
   const observe = options.observe ?? memoizedObserver();
   const summary = queue.transaction(state => {
-    const result = { scanned: 0, skipped: 0, changed: 0, notified: 0, states: {} };
+    const result = { scanned: 0, skipped: 0, changed: 0, notified: 0, ingested: 0, states: {} };
     const subjects = coordinationSubjects(state);
+    // Registered candidate files are read first, so a worker that publishes a checkpoint file
+    // instead of calling `ready` still reaches this mechanism in the same transaction.
+    for (const outcome of ingestCandidates(queue.root, subjects, options)) if (outcome.ingested) result.ingested++;
     for (const subject of subjects) {
       if (!inAdoptionScope(subject, options)) { result.skipped++; continue; }
       const outcome = refreshSubject(state, subject, { ...options, observe });
@@ -394,6 +416,20 @@ export function publishReadiness(queue, id, {
     subject.revision = subject.kind === 'job' ? revision : record.reviewSeq;
     refreshSubject(state, subject, { ...options, now });
     return structuredClone(record.coordination);
+  });
+}
+
+// Executor-facing registration of the owner's own candidate file. It says where readiness may
+// be read from; the file's contents are never treated as approval or verification.
+export function registerCandidateSource(queue, id, { owner, file, location = 'candidates', now = Date.now(), ...options } = {}) {
+  if (!text(owner) || owner.length > 200) throw new Error('Candidate registration requires the owning identity');
+  return queue.transaction(state => {
+    const subject = findSubject(state, id);
+    if (text(subject.owner) && subject.owner !== owner) throw new Error('Candidate registration ownership mismatch');
+    const source = attachCandidateSource(subject, { file, location, owner, registeredBy: owner, now });
+    for (const outcome of ingestCandidates(queue.root, [subject], { ...options, now })) source.ingested = outcome.ingested;
+    refreshSubject(state, subject, { ...options, now });
+    return { id: subject.id, candidateSource: source, coordination: structuredClone(subject.record.coordination) };
   });
 }
 

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { findSubject, refreshSubject, reviewFacts, approvalDrift } from './coordination.js';
+import { attachCandidateSource } from './candidates.js';
 import { memoizedObserver, artifactDrift } from './artifact.js';
 import { safeReference, markDelivered, markAcknowledged } from './notifications.js';
 import { externalAuthorizations, routingPolicy, ROUTED_MODE, ROUTED_PROVIDER, LEGACY_MAX_CONCURRENCY } from './admission.js';
@@ -78,8 +79,12 @@ export function approve(queue, id, { coordinatorId, coordinatorToken, sha, diges
     if (!review) throw new Error('There is no published review readiness to approve');
     assertNotSelfReview(role.id, subject, review);
     if (review.sha !== sha || review.digest !== digest) throw new Error('Approval must bind the exact reviewed SHA and digest');
-    const drift = artifactDrift({ sha: review.sha, digest: review.digest, digestKind: review.digestKind, checkpointDigest: review.checkpointDigest ?? null }, observation);
-    if (drift) throw new Error(`Reviewed artifact changed since readiness (${drift}); re-review before approving`);
+    // Approving requires provable artifact evidence right now, not just an unchanged record.
+    const drift = artifactDrift(
+      { sha: review.sha, digest: review.digest, digestKind: review.digestKind, checkpointDigest: review.checkpointDigest ?? null },
+      observation, { requireEvidence: true },
+    );
+    if (drift) throw new Error(`Reviewed artifact is not currently provable (${drift}); re-review before approving`);
     subject.record.coordination = {
       ...(subject.coordination ?? {}),
       approval: {
@@ -138,6 +143,15 @@ export function recordVerification(queue, id, { coordinatorId, coordinatorToken,
       },
     };
     subject.coordination = subject.record.coordination;
+  }, { ...options, now });
+}
+
+// Adopts an already existing owned candidate file for a record the coordinator did not
+// create. It registers where to read readiness from; it never approves that readiness.
+export function adoptCandidateSource(queue, id, { coordinatorId, coordinatorToken, file, location = 'candidates', owner = null, now = Date.now(), ...options } = {}) {
+  const role = assertCoordinator(queue.root, { coordinatorId, coordinatorToken });
+  return coordinatorChange(queue, id, role, ({ subject }) => {
+    attachCandidateSource(subject, { file, location, owner: owner ?? subject.owner, registeredBy: role.id, now });
   }, { ...options, now });
 }
 

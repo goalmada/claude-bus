@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { PersonalQueue } from '../src/personal/queue.js';
-import { publishReadiness, reconcileCoordination, DEFAULT_OVERDUE_MS } from '../src/personal/coordination.js';
+import { publishReadiness, registerCandidateSource, reconcileCoordination, DEFAULT_OVERDUE_MS } from '../src/personal/coordination.js';
 import { pendingNotifications, notificationHistory, publishNotificationFiles } from '../src/personal/notifications.js';
 import * as coordinator from '../src/personal/coordinator.js';
 
@@ -165,4 +165,33 @@ test('acknowledging an unknown record is refused rather than silently ignored', 
   const role = roster(queue);
   assert.throws(() => coordinator.acknowledge(queue, { ...role, ids: ['not-a-real-id'] }), /Unknown notification id/);
   assert.throws(() => coordinator.acknowledge(queue, { ...role, ids: [] }), /notification ids/);
+});
+
+test('a candidate file reaching readiness notifies once and alerts when overdue', t => {
+  const queue = fixture(t, { status: 'reported', baseSha: sha('base'), resultHash: digestOf('report'), finishedAt: '2026-09-08T11:59:30.000Z' });
+  // A worker that publishes a checkpoint file instead of calling `ready` still reaches the
+  // coordinator, through the explicitly registered source and the same outbox.
+  const directory = path.join(queue.root, 'candidates');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(directory, 'task-one.json'), JSON.stringify({
+    owner: 'worker-owner', reviewer: 'root-coordinator', sha: sha('candidate-head'),
+    resultHash: digestOf('candidate-result'), evidence: 'private:candidate/task-one',
+  }), { mode: 0o600 });
+  registerCandidateSource(queue, 'task-one', { owner: 'worker-owner', file: 'task-one.json', birth: () => BIRTH, now: NOW });
+
+  const alerts = pendingNotifications(queue).filter(entry => entry.state === 'needs_review');
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].sha, sha('candidate-head'));
+  assert.equal(alerts[0].digest, digestOf('candidate-result'));
+  assert.equal(alerts[0].evidenceRef, 'private:candidate/task-one');
+  assert.equal(alerts[0].reason, 'enter_needs_review');
+
+  for (const step of [1, 2, 3]) reconcileCoordination(queue, { birth: () => BIRTH, now: NOW + step * 1000 });
+  assert.equal(pendingNotifications(queue).length, 1);
+  reconcileCoordination(queue, { birth: () => BIRTH, now: NOW + DEFAULT_OVERDUE_MS + 1000 });
+  assert.equal(pendingNotifications(queue).filter(entry => entry.reason === 'overdue_review').length, 1);
+
+  // No candidate content beyond the declared references reaches the alert.
+  const serialized = JSON.stringify(pendingNotifications(queue));
+  for (const secret of ['PRIVATE_BRIEF_TEXT', 'PRIVATE_RESULT_TEXT', 'PRIVATE_TOKEN_TEXT']) assert.equal(serialized.includes(secret), false);
 });

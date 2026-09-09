@@ -7,7 +7,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { execFileSync, spawn } from 'node:child_process';
 import { validateScope, checkpoint, assertDiffScope } from './workspace.js';
 import { INFLIGHT_STATUSES, assertAdmission } from './admission.js';
-import { processBirth } from './process-identity.js';
+import { observeBirth } from './process-identity.js';
 import { normalizeSubject, refreshSubject } from './coordination.js';
 
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -193,7 +193,7 @@ export class PersonalQueue {
       const claim = reservationId !== undefined && reservation?.taskId === id ? { key: `task:${id}`, kind: 'runner' } : null;
       assertAdmission(state, { claim });
       job.attempts ??= [];
-      if (job.launchId) job.attempts.push({ launchId: job.launchId, authorizationId:job.authorizationId ?? null, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });
+      if (job.launchId) job.attempts.push({ launchId: job.launchId, authorizationId:job.authorizationId ?? null, policyId:job.policyId ?? null, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });
       job.cancelRequested = false; job.pauseRequested = false;
       delete job.result; delete job.resultHash; delete job.runtime; delete job.reason; delete job.sessionId;
       // A new attempt withdraws the previous readiness. Any approval bound to it becomes
@@ -202,6 +202,7 @@ export class PersonalQueue {
       job.status = 'launching';
       job.launchId = launchId;
       job.authorizationId = reservation?.id === reservationId ? reservation?.authorizationId ?? null : null;
+      job.policyId = reservation?.id === reservationId ? reservation?.policyId ?? null : null;
       job.startedAt = new Date().toISOString();
       return job;
     });
@@ -241,10 +242,14 @@ export class PersonalQueue {
     return await new Promise((resolve, reject) => {
       child.once('spawn', () => {
         try {
-          // Record the process birth with the PID: a number alone cannot be attributed to
-          // this launch later, and a reused PID must be detectable rather than assumed.
-          const birth = processBirth(child.pid);
-          this.change(id, j => { if (j.status !== 'launching') throw new Error('Launch was reconciled externally'); j.status = 'running'; j.pid = child.pid; j.process = { pid: child.pid, birth, startedAt: new Date().toISOString() }; });
+          // Record the PID immediately, then attach the process birth as soon as it is
+          // observed. A number alone cannot be attributed to this launch later and a reused
+          // PID must be detectable, but observing the birth must never stall this stream.
+          this.change(id, j => { if (j.status !== 'launching') throw new Error('Launch was reconciled externally'); j.status = 'running'; j.pid = child.pid; j.process = { pid: child.pid, birth: null, birthPending: true, startedAt: new Date().toISOString() }; });
+          observeBirth(child.pid, birth => {
+            try { this.change(id, j => { if (j.process?.pid === child.pid && j.process.birthPending) j.process = { ...j.process, birth, birthPending: false }; }); }
+            catch { /* the launch was reconciled or finished; identity stays explicitly unprovable */ }
+          });
           timer = setTimeout(() => stop('timed_out'), job.timeoutMs);
           poll = setInterval(() => {
             try { const current = this.get(id); if (current.cancelRequested || current.status === 'uncertain') stop('cancelled'); else if (current.pauseRequested) stop('paused'); }
