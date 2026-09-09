@@ -20,8 +20,8 @@
   "scripts": {
     "start": "node src/server.js",
     "build": "node scripts/build-personal-schema.js",
-    "test": "node test/smoke.js && node test/mcp_roundtrip_orders.js && node test/mcp_claim_flow.js && node --test test/session-host.test.js test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js test/dispatcher.test.js test/worker.test.js test/service.test.js test/event-schema.test.js test/native-gate.test.js test/native-gate-file.test.js test/authorization-batch.test.js",
-    "test:personal": "node --test test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js test/dispatcher.test.js test/worker.test.js test/service.test.js test/event-schema.test.js test/native-gate.test.js test/native-gate-file.test.js test/authorization-batch.test.js"
+    "test": "node test/smoke.js && node test/mcp_roundtrip_orders.js && node test/mcp_claim_flow.js && node --test test/session-host.test.js test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js test/dispatcher.test.js test/worker.test.js test/service.test.js test/event-schema.test.js test/native-gate.test.js test/native-gate-file.test.js test/authorization-batch.test.js test/coordination.test.js test/notifications.test.js test/admission.test.js",
+    "test:personal": "node --test test/personal-queue.test.js test/project-tools.test.js test/projection.test.js test/checks.test.js test/dispatcher.test.js test/worker.test.js test/service.test.js test/event-schema.test.js test/native-gate.test.js test/native-gate-file.test.js test/authorization-batch.test.js test/coordination.test.js test/notifications.test.js test/admission.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

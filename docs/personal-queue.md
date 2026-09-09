@@ -133,3 +133,28 @@ A new batch records the previous batch's ID, limit, unused remainder, evidence a
 Runner reservations carry their authorization ID into the task and preserved attempts. The live `remaining` count stays authoritative; historical records preserve the original counters. A new explicit approval never increases concurrency or grants more than five attempts. No automatic renewal or increase is introduced.
 
 The first useful task of a separately approved five-attempt trial used actual native Max to write the pure history/replay helper and eleven tests. Native execution took about114 seconds and passed its tests. The coordinator independently reran them, then hardened malformed-counter and explicit-revocation cases before integration. Those review corrections are why native success alone is not the release gate. The previous trial's five consumed attempts remain separately recorded; this task consumed one attempt in the new trial.
+
+## Coordination states, notifications and shared admission
+
+Execution status alone could not distinguish a worker that was still working from one that had
+finished and was waiting for a coordinator, because a living PID looked like progress. The
+queue now also carries a durable coordination record next to each task and each external
+launch: `running`, `needs_review`, `approved`, `deploying`, `verified` or `blocked`, with
+legacy `reported` mapping to `needs_review`. Review readiness is evaluated before liveness, so
+a live worker waiting for review is never advertised as merely working.
+
+Meaningful transitions enqueue a durable, deduplicated notification, plus one overdue alert
+after two minutes of waiting for review. The existing root heartbeat consumes that outbox
+through `coordination-reconcile`, `notifications` and the coordinator acknowledgement
+commands; no scheduler is added. A mirrored outbox file is availability, not delivery.
+
+Approval, deployment and verification are coordinator commands behind a role proof and are
+bound to an exact SHA and digest, which the reconciler re-checks against the assigned worktree.
+Launch admission is one shared bound across the legacy runner, direct dispatch and external
+launches, serial by default and governed by the recorded routing policy and machine capacity
+when one is approved. Historical launch counters and authorization history are preserved as
+history and never refilled.
+
+See [COORDINATION-RELIABILITY.md](COORDINATION-RELIABILITY.md) for the state table, the
+approval and notification contracts, the ledger migration, install and rollback steps, and the
+known limits.

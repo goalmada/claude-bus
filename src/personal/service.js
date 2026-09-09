@@ -6,18 +6,21 @@ import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { publishEvents } from './service-events.js';
+import { admissionStatus, assertAdmission, taskClaimed } from './admission.js';
+import { reconcileCoordination } from './coordination.js';
+import { processBirth } from './process-identity.js';
 
 const busy = new Set(['launching','running','checking','uncertain']);
-export function processBirth(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try { return execFileSync('/bin/ps', ['-p', String(pid), '-o', 'lstart='], { encoding:'utf8', timeout:2000 }).trim() || null; }
-  catch { return null; }
-}
+// Re-exported so existing importers (the durable runner) keep working unchanged.
+export { processBirth };
 export function serviceState(queue) {
   const state = queue.transaction(state => structuredClone(state.service ?? { enabled:false, remaining:0, runner:null }));
   const health = path.join(queue.root, 'service-health.json');
   const { ok, reason } = inspectNativeGate(queue.root);
-  return { ...state, nativeGate:{ ok, reason }, health:fs.existsSync(health) ? JSON.parse(fs.readFileSync(health,'utf8')) : null };
+  let admission = null;
+  try { admission = admissionStatus(queue.snapshot()); }
+  catch { admission = { error:'admission_inspection_required' }; }
+  return { ...state, nativeGate:{ ok, reason }, admission, health:fs.existsSync(health) ? JSON.parse(fs.readFileSync(health,'utf8')) : null };
 }
 export function configureService(queue, request) {
   return queue.transaction(state => {
@@ -27,7 +30,7 @@ export function configureService(queue, request) {
   });
 }
 
-export function serviceTick(queue, { launch = launchRunner, birth = processBirth, now = Date.now() } = {}) {
+export function serviceTick(queue, { launch = launchRunner, birth = processBirth, now = Date.now(), coordination = {} } = {}) {
   publishEvents(queue);
   let reservation = null;
   const outcome = queue.transaction(state => {
@@ -59,12 +62,23 @@ export function serviceTick(queue, { launch = launchRunner, birth = processBirth
     if (!gate.ok) return { state:'blocked', reason:gate.reason, taskId:next.id };
     const quota = state.jobs.find(job => job.capacity?.status === 'rejected' && !job.verification && job.status !== 'cancelled');
     if (quota) return { state:'blocked', reason:'provider_capacity_rejected', taskId:quota.id };
+    // The same bounded admission helper the direct route uses, so external launches and this
+    // runner share one atomic limit instead of two independent ones. No slot is excluded
+    // here: the reservation for this task is created below, after admission.
+    if (taskClaimed(state, next.id, { birth, now })) return { state:'blocked', reason:'task_identity_claimed', taskId:next.id };
+    try { assertAdmission(state, { birth, now }); }
+    catch { return { state:'blocked', reason:'launch_admission_full', taskId:next.id }; }
     reservation = { id:crypto.randomUUID(), authorizationId:service.authorizationId ?? null, taskId:next.id, createdAt:new Date(now).toISOString(), pid:null, birth:null };
     service.runner = reservation;
     service.remaining--;
     return { state:'launching', taskId:next.id, runnerId:reservation.id };
   });
   if (reservation) launch(queue, reservation);
+  // Durable coordination and its notification outbox are refreshed from the same loop that
+  // already runs here. No new scheduler is introduced, and a bookkeeping failure never
+  // changes the launch outcome.
+  try { reconcileCoordination(queue, { birth, now, ...coordination }); }
+  catch { /* recomputed by the next tick or by the root heartbeat */ }
   return outcome;
 }
 

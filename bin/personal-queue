@@ -7,11 +7,17 @@ import { approveCheck, runApprovedCheck } from '../src/personal/checks.js';
 import { nativeClaude } from '../src/personal/claude.js';
 import { dispatchNext } from '../src/personal/dispatcher.js';
 import { workQueue } from '../src/personal/worker.js';
+import { publishReadiness, publishProgress, coordinationView, coordinationSummary, reconcileCoordination } from '../src/personal/coordination.js';
+import { pendingNotifications } from '../src/personal/notifications.js';
+import { admissionStatus, reserveLaunch, attachExternalProcess, finalizeExternalLaunch } from '../src/personal/admission.js';
+import * as coordinator from '../src/personal/coordinator.js';
 
 const [action, id] = process.argv.slice(2);
+const needsId = ['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume', 'handoff', 'approve-check', 'check',
+  'ready', 'progress', 'coordination', 'coord-approve', 'coord-deploy', 'coord-verify', 'launch-attach', 'launch-finalize'];
 try {
   const queue = new PersonalQueue();
-  if (['status', 'run', 'cancel', 'reconcile', 'resolve', 'verify', 'pause', 'resume', 'handoff', 'approve-check', 'check'].includes(action) && !id) throw new Error('Task id required');
+  if (needsId.includes(action) && !id) throw new Error('Task, subject or launch id required');
   let result;
   const input = () => JSON.parse(fs.readFileSync(0, 'utf8'));
   switch (action) {
@@ -34,6 +40,30 @@ try {
       finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
       process.exit(0); break;
     }
+    // Executor surface: a worker may publish readiness and progress. It has no approval,
+    // deployment, verification, routing or acknowledgement command at all.
+    case 'ready': console.log(JSON.stringify(publishReadiness(queue, id, input()), null, 2)); process.exit(0); break;
+    case 'progress': console.log(JSON.stringify(publishProgress(queue, id, input()), null, 2)); process.exit(0); break;
+    case 'coordination': console.log(JSON.stringify(coordinationView(queue, id), null, 2)); process.exit(0); break;
+    case 'coordination-list': console.log(JSON.stringify(coordinationSummary(queue, { all: process.argv[3] === '--all' }), null, 2)); process.exit(0); break;
+    case 'coordination-reconcile': console.log(JSON.stringify(reconcileCoordination(queue), null, 2)); process.exit(0); break;
+    case 'notifications': console.log(JSON.stringify(pendingNotifications(queue, { includeDelivered: process.argv[3] !== '--undelivered' }), null, 2)); process.exit(0); break;
+    case 'admission': console.log(JSON.stringify(admissionStatus(queue.snapshot()), null, 2)); process.exit(0); break;
+    // Launch ledger: reserving cites either an approved routing policy plus the authorized
+    // task identity, or a finite legacy external authorization.
+    case 'launch-reserve': console.log(JSON.stringify(reserveLaunch(queue, input()), null, 2)); process.exit(0); break;
+    case 'launch-attach': console.log(JSON.stringify(attachExternalProcess(queue, id, input()), null, 2)); process.exit(0); break;
+    case 'launch-finalize': console.log(JSON.stringify(finalizeExternalLaunch(queue, id, input()), null, 2)); process.exit(0); break;
+    // Coordinator surface: every command below requires the recorded role proof.
+    case 'coord-approve': console.log(JSON.stringify(coordinator.approve(queue, id, input()), null, 2)); process.exit(0); break;
+    case 'coord-deploy': console.log(JSON.stringify(coordinator.startDeployment(queue, id, input()), null, 2)); process.exit(0); break;
+    case 'coord-verify': console.log(JSON.stringify(coordinator.recordVerification(queue, id, input()), null, 2)); process.exit(0); break;
+    case 'coord-routing-policy': console.log(JSON.stringify(coordinator.setRoutingPolicy(queue, input()), null, 2)); process.exit(0); break;
+    case 'coord-machine-capacity': console.log(JSON.stringify(coordinator.recordMachineCapacity(queue, input()), null, 2)); process.exit(0); break;
+    case 'coord-authorize-external': console.log(JSON.stringify(coordinator.authorizeExternalLaunches(queue, input()), null, 2)); process.exit(0); break;
+    case 'coord-concurrency': console.log(JSON.stringify(coordinator.setConcurrency(queue, input()), null, 2)); process.exit(0); break;
+    case 'coord-notify-delivered': console.log(JSON.stringify(coordinator.confirmDelivery(queue, input()), null, 2)); process.exit(0); break;
+    case 'coord-notify-ack': console.log(JSON.stringify(coordinator.acknowledge(queue, input()), null, 2)); process.exit(0); break;
     case 'approve-check': result = approveCheck(queue, id, input()); break;
     case 'check': result = await runApprovedCheck(queue, id); break;
     case 'handoff': console.log(JSON.stringify(dashboardHandoff(queue.get(id), input()), null, 2)); process.exit(0); break;
@@ -50,7 +80,12 @@ try {
     case 'reconcile': result = queue.reconcile(id); break;
     case 'resolve': result = queue.resolveUncertain(id, input().evidence); break;
     case 'verify': result = queue.verify(id, input()); break;
-    default: throw new Error('Usage: personal-queue submit|list|status|run|dispatch|work|pause|resume|cancel|reconcile|resolve|verify|handoff|approve-check|check [id]. Input JSON uses stdin. State and results stay in the private queue directory.');
+    default: throw new Error([
+      'Usage: personal-queue submit|list|status|run|dispatch|work|pause|resume|cancel|reconcile|resolve|verify|handoff|approve-check|check [id]',
+      'Coordination: ready|progress|coordination|coordination-list|coordination-reconcile|notifications|admission|launch-reserve|launch-attach|launch-finalize [id]',
+      'Coordinator only (role proof required): coord-approve|coord-deploy|coord-verify|coord-routing-policy|coord-machine-capacity|coord-authorize-external|coord-concurrency|coord-notify-delivered|coord-notify-ack [id]',
+      'Input JSON uses stdin. State and results stay in the private queue directory.',
+    ].join('\n'));
   }
   // Deliberately never print briefs, results, account details or verification evidence.
   console.log(JSON.stringify(Array.isArray(result) ? result : { id: result.id, status: result.status, revision: result.revision, owner: result.owner, sourceTask: result.sourceTask, launchId: result.launchId, resultHash: result.resultHash, reason: result.reason }, null, 2));

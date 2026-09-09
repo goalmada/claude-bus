@@ -6,9 +6,12 @@ import crypto from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { execFileSync, spawn } from 'node:child_process';
 import { validateScope, checkpoint, assertDiffScope } from './workspace.js';
+import { INFLIGHT_STATUSES, assertAdmission } from './admission.js';
+import { processBirth } from './process-identity.js';
+import { normalizeSubject, refreshSubject } from './coordination.js';
 
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
-const inflight = new Set(['launching', 'running', 'uncertain', 'checking']);
+const inflight = INFLIGHT_STATUSES;
 const terminal = new Set(['verified', 'failed', 'cancelled', 'timed_out']);
 const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 
@@ -89,10 +92,14 @@ export class PersonalQueue {
     });
   }
 
-  get(id) {
-    // Atomic replacement gives readers a complete snapshot without contending with a writer.
+  // Atomic replacement gives readers a complete snapshot without contending with a writer.
+  snapshot() {
     const state = fs.existsSync(this.file) ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : { version: 1, jobs: [] };
     if (state.version !== 1 || !Array.isArray(state.jobs)) throw new Error('Unsupported queue format');
+    return state;
+  }
+  get(id) {
+    const state = this.snapshot();
     return structuredClone(id ? this.find(state, id) : state.jobs);
   }
   find(state, id) {
@@ -100,7 +107,9 @@ export class PersonalQueue {
     if (!job) throw new Error('Unknown task');
     return job;
   }
-  change(id, fn) { return this.transaction(state => { const job = this.find(state, id); fn(job); return job; }); }
+  // `fn` also receives the open state so a caller can update coordination bookkeeping in the
+  // same synced transaction as the execution change it describes.
+  change(id, fn) { return this.transaction(state => { const job = this.find(state, id); fn(job, state); return job; }); }
 
   cancel(id) {
     return this.change(id, job => {
@@ -178,11 +187,18 @@ export class PersonalQueue {
       const reservation = state.service?.runner;
       if (reservationId !== undefined && (!reservation || reservation.finishedAt || reservation.id !== reservationId || reservation.taskId !== id)) throw new Error('Invalid service reservation for this task');
       if (reservation && !reservation.finishedAt && reservation.id !== reservationId) throw new Error('Service runner owns the executor reservation');
-      if (state.jobs.some(j => inflight.has(j.status))) throw new Error('One executor at a time; reconcile unfinished launches first');
+      // Shared bounded admission across the service runner, this dispatch and external
+      // launches. Only the validated service reservation for this exact task releases its own
+      // slot; any other record under that identity still counts.
+      const claim = reservationId !== undefined && reservation?.taskId === id ? { key: `task:${id}`, kind: 'runner' } : null;
+      assertAdmission(state, { claim });
       job.attempts ??= [];
       if (job.launchId) job.attempts.push({ launchId: job.launchId, authorizationId:job.authorizationId ?? null, resultHash: job.resultHash ?? null, checkpointHash: job.checkpoint?.hash ?? null, finishedAt: job.finishedAt ?? null });
       job.cancelRequested = false; job.pauseRequested = false;
       delete job.result; delete job.resultHash; delete job.runtime; delete job.reason; delete job.sessionId;
+      // A new attempt withdraws the previous readiness. Any approval bound to it becomes
+      // stale by derivation and is kept as a record rather than silently reused.
+      delete job.review; delete job.progressAt;
       job.status = 'launching';
       job.launchId = launchId;
       job.authorizationId = reservation?.id === reservationId ? reservation?.authorizationId ?? null : null;
@@ -225,7 +241,10 @@ export class PersonalQueue {
     return await new Promise((resolve, reject) => {
       child.once('spawn', () => {
         try {
-          this.change(id, j => { if (j.status !== 'launching') throw new Error('Launch was reconciled externally'); j.status = 'running'; j.pid = child.pid; });
+          // Record the process birth with the PID: a number alone cannot be attributed to
+          // this launch later, and a reused PID must be detectable rather than assumed.
+          const birth = processBirth(child.pid);
+          this.change(id, j => { if (j.status !== 'launching') throw new Error('Launch was reconciled externally'); j.status = 'running'; j.pid = child.pid; j.process = { pid: child.pid, birth, startedAt: new Date().toISOString() }; });
           timer = setTimeout(() => stop('timed_out'), job.timeoutMs);
           poll = setInterval(() => {
             try { const current = this.get(id); if (current.cancelRequested || current.status === 'uncertain') stop('cancelled'); else if (current.pauseRequested) stop('paused'); }
@@ -252,7 +271,8 @@ export class PersonalQueue {
             }
             if (event.type === 'system' && event.subtype === 'api_retry' && ['rate_limit','authentication_failed','billing_error','oauth_org_not_allowed'].includes(event.error)) stop('blocked');
             if (event.type === 'system' && event.subtype === 'init') {
-              this.change(id, j => { j.sessionId = event.session_id ?? null; j.runtime = { tools: event.tools ?? [], mcpServers: event.mcp_servers ?? [], sessionId: event.session_id ?? null }; });
+              // A coarse progress fact for staleness. Plain metadata rewrites never count.
+              this.change(id, j => { j.sessionId = event.session_id ?? null; j.progressAt = new Date().toISOString(); j.runtime = { tools: event.tools ?? [], mcpServers: event.mcp_servers ?? [], sessionId: event.session_id ?? null }; });
               if (spec.expectedTools?.length && (spec.expectedTools.some(tool => !event.tools?.includes(tool)) || event.tools?.some(tool => !spec.expectedTools.includes(tool)))) stop('blocked');
               else initConfirmed = true;
             }
@@ -271,22 +291,29 @@ export class PersonalQueue {
         // Cancellation owns this process group. Do not signal historical PIDs on success.
         if (stopping) signal('SIGKILL');
         try {
-          resolve(this.change(id, j => {
-            if (j.mode === 'project') {
-              try { assertDiffScope(j.worktree, j.scope); j.checkpoint = checkpoint(j.worktree, j.scope); }
-              catch { j.status = 'uncertain'; j.reason = 'Workspace changed outside scope; preserve edits and inspect'; }
-            }
-            if (j.status === 'uncertain') return;
-            j.exitCode = code; j.exitSignal = sig; j.eventCount = count; j.finishedAt = new Date().toISOString();
-            if (signalDenied) { j.status = 'uncertain'; j.reason = 'Owned process group termination could not be confirmed'; return; }
-            if (stopping) { j.status = stopping; j.reason = stopping === 'uncertain' ? 'Supervisor state synchronization failed; inspect the owned process group' : 'Execution stopped by supervisor'; return; }
-            if (j.cancelRequested) { j.status = 'cancelled'; return; }
-            if (spawnError || code !== 0 || protocolError || pending.trim() || !result) { j.status = 'failed'; j.reason = 'Executor failed or returned incomplete structured output'; return; }
-            if (spec.expectedTools?.length && !initConfirmed) { j.status = 'blocked'; j.reason = 'Required tools were not confirmed by runtime initialization'; return; }
-            if (result.is_error || result.subtype !== 'success' || typeof result.result !== 'string' || result.permission_denials?.length) {
-              j.status = 'blocked'; j.reason = 'Executor reported an error or denied permission; no fallback'; return;
-            }
-            j.status = 'reported'; j.result = result.result; j.sessionId = result.session_id ?? null; j.resultHash = digest(j.result);
+          resolve(this.change(id, (j, state) => {
+            const settle = () => {
+              if (j.mode === 'project') {
+                try { assertDiffScope(j.worktree, j.scope); j.checkpoint = checkpoint(j.worktree, j.scope); }
+                catch { j.status = 'uncertain'; j.reason = 'Workspace changed outside scope; preserve edits and inspect'; }
+              }
+              if (j.status === 'uncertain') return;
+              j.exitCode = code; j.exitSignal = sig; j.eventCount = count; j.finishedAt = new Date().toISOString();
+              if (signalDenied) { j.status = 'uncertain'; j.reason = 'Owned process group termination could not be confirmed'; return; }
+              if (stopping) { j.status = stopping; j.reason = stopping === 'uncertain' ? 'Supervisor state synchronization failed; inspect the owned process group' : 'Execution stopped by supervisor'; return; }
+              if (j.cancelRequested) { j.status = 'cancelled'; return; }
+              if (spawnError || code !== 0 || protocolError || pending.trim() || !result) { j.status = 'failed'; j.reason = 'Executor failed or returned incomplete structured output'; return; }
+              if (spec.expectedTools?.length && !initConfirmed) { j.status = 'blocked'; j.reason = 'Required tools were not confirmed by runtime initialization'; return; }
+              if (result.is_error || result.subtype !== 'success' || typeof result.result !== 'string' || result.permission_denials?.length) {
+                j.status = 'blocked'; j.reason = 'Executor reported an error or denied permission; no fallback'; return;
+              }
+              j.status = 'reported'; j.result = result.result; j.sessionId = result.session_id ?? null; j.resultHash = digest(j.result);
+            };
+            settle();
+            // Durable coordination for the finished attempt, in the same transaction as the
+            // execution outcome, so a completed executor is advertised as needing review
+            // immediately. A bookkeeping failure is recovered by the next reconciliation.
+            try { refreshSubject(state, normalizeSubject(j, 'job'), {}); } catch { /* recomputed by reconcileCoordination */ }
           }));
         } catch (error) { reject(error); }
       });
